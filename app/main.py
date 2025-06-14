@@ -8,6 +8,7 @@ import logging
 import json
 from urllib.parse import urlencode
 import traceback
+import re
 
 # Load environment variables
 load_dotenv()
@@ -149,6 +150,10 @@ async def parse_expense_from_text(text: str) -> dict:
         )
         content = response.choices[0].message.content
         logging.debug(f"OpenAI response content: {content}")
+
+        # Remove markdown code block if present
+        content = re.sub(r"^```json\s*|^```\s*|```$", "", content.strip(), flags=re.MULTILINE).strip()
+
         return json.loads(content)
     except json.JSONDecodeError as e:
         logging.error(f"OpenAI returned invalid JSON: {content}")
