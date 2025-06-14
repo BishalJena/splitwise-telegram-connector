@@ -134,17 +134,23 @@ async def callback_oauth(oauth_token: str, oauth_verifier: str, chat_id: int):
 
 # ----------- Services -----------
 async def parse_expense_from_text(text: str) -> dict:
-    prompt = f"Extract amount, description, paid_by and owed_by from: '{text}' as JSON."
+    prompt = (
+        "Extract amount, description, paid_by and owed_by from: '{}'. Respond ONLY with a valid JSON object, no explanation.".format(text)
+    )
     try:
         response = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}]
         )
         content = response.choices[0].message.content
+        logging.debug(f"OpenAI response content: {content}")
         return json.loads(content)
+    except json.JSONDecodeError as e:
+        logging.error(f"OpenAI returned invalid JSON: {content}")
+        raise HTTPException(status_code=500, detail=f"Parsing failed: Invalid JSON returned by model: {content}")
     except Exception as e:
-        logging.error(f"OpenAI parsing error: {e}")
-        raise HTTPException(status_code=500, detail="Parsing failed")
+        logging.error(f"OpenAI parsing error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Parsing failed: {str(e)}")
 
 async def create_splitwise_expense(chat_id: str, expense: dict):
     token = get_user_token(chat_id)
