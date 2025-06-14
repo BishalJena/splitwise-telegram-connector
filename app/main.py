@@ -215,6 +215,10 @@ async def setup_telegram_webhook(data: WebhookInput):
         logger.error(f"Webhook setup failed: {e}")
         raise HTTPException(status_code=500, detail="Webhook setup failed")
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 app.include_router(router)
 
 @app.get("/")
