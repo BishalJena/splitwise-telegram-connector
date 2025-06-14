@@ -138,7 +138,8 @@ async def parse_expense_from_text(text: str) -> dict:
         "Extract amount, description, paid_by and owed_by from: '{}'. Respond ONLY with a valid JSON object, no explanation.".format(text)
     )
     try:
-        response = openai.ChatCompletion.create(
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}]
         )
