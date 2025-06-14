@@ -51,6 +51,10 @@ app = FastAPI(
 )
 router = APIRouter()
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 # ----------- Models -----------
 class ExpenseInput(BaseModel):
     cost: float
