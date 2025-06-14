@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+user_tokens.json
+pending_oauth.json
+.DS_Store
+.idea/
+.vscode/
