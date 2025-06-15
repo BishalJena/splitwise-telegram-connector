@@ -20,13 +20,13 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(m
 # ====== Environment Variables ======
 # Please set these in your Render/hosting environment
 TELEGRAM_BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN")    # e.g. '123456:ABC-DEF...'
-SPLITWISE_CONSUMER_KEY    = os.getenv("SPLITWISE_CONSUMER_KEY")    # your Splitwise consumer key
-SPLITWISE_CONSUMER_SECRET = os.getenv("SPLITWISE_CONSUMER_SECRET")  # your Splitwise consumer secret
+SPLITWISE_CLIENT_ID    = os.getenv("SPLITWISE_CLIENT_ID")    # your Splitwise OAuth2 client id
+SPLITWISE_CLIENT_SECRET = os.getenv("SPLITWISE_CLIENT_SECRET")  # your Splitwise OAuth2 client secret
 OPENAI_API_KEY            = os.getenv("OPENAI_API_KEY")            # your OpenAI API key
 CALLBACK_BASE_URL         = os.getenv("CALLBACK_BASE_URL")         # e.g. 'https://your-domain.com/auth/splitwise/callback'
 
 # Validate critical env vars
-for var_name in ["TELEGRAM_BOT_TOKEN", "SPLITWISE_CONSUMER_KEY", "SPLITWISE_CONSUMER_SECRET", "OPENAI_API_KEY", "CALLBACK_BASE_URL"]:
+for var_name in ["TELEGRAM_BOT_TOKEN", "SPLITWISE_CLIENT_ID", "SPLITWISE_CLIENT_SECRET", "OPENAI_API_KEY", "CALLBACK_BASE_URL"]:
     if not globals().get(var_name):
         logging.error(f"Missing required environment variable: {var_name}")
         # If missing, the service will still start, but endpoints depending on it will fail.
@@ -36,13 +36,11 @@ openai.api_key = OPENAI_API_KEY
 
 # Storage files
 tokens_file = "user_tokens.json"
-pending_file = "pending_oauth.json"
 
 # Ensure storage exists
-for fname in (tokens_file, pending_file):
-    if not os.path.exists(fname):
-        with open(fname, 'w') as f:
-            json.dump({}, f)
+if not os.path.exists(tokens_file):
+    with open(tokens_file, 'w') as f:
+        json.dump({}, f)
 
 # Initialize FastAPI
 app = FastAPI(
@@ -87,54 +85,36 @@ def set_user_token(chat_id: str, access_token: str):
     tokens[chat_id] = access_token
     save_json(tokens_file, tokens)
 
-# ----------- Splitwise OAuth Flow -----------
+# ----------- Splitwise OAuth 2.0 Flow -----------
 @router.get("/auth/splitwise/start")
 async def start_oauth(chat_id: int):
-    """Begin OAuth flow: redirect user to Splitwise authorize URL."""
-    request_url = "https://secure.splitwise.com/oauth/request_token"
-    callback_url = f"{CALLBACK_BASE_URL}?chat_id={chat_id}"
     params = {
-        'oauth_consumer_key': SPLITWISE_CONSUMER_KEY,
-        'oauth_signature_method': 'PLAINTEXT',
-        'oauth_signature': f"{SPLITWISE_CONSUMER_SECRET}&",
-        'oauth_callback': callback_url
+        "client_id": SPLITWISE_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": f"{CALLBACK_BASE_URL}?chat_id={chat_id}",
+        "scope": "",  # Splitwise does not use scopes, but keep for spec compliance
+        "state": str(chat_id)
     }
-    async with httpx.AsyncClient() as client:
-        res = await client.post(request_url, params=params)
-        res.raise_for_status()
-    data = dict(pair.split('=') for pair in res.text.split('&'))
-    request_token = data['oauth_token']
-    request_secret = data['oauth_token_secret']
-
-    pending = load_json(pending_file)
-    pending[str(chat_id)] = {'request_token': request_token, 'request_secret': request_secret}
-    save_json(pending_file, pending)
-
-    auth_url = f"https://secure.splitwise.com/oauth/authorize?{urlencode({'oauth_token': request_token})}"
+    auth_url = f"https://secure.splitwise.com/oauth/authorize?{urlencode(params)}"
     return {"auth_url": auth_url}
 
 @router.get("/auth/splitwise/callback")
-async def callback_oauth(oauth_token: str, oauth_verifier: str, chat_id: int):
-    """Handle OAuth callback: exchange for access token and store it."""
-    pending = load_json(pending_file)
-    entry = pending.pop(str(chat_id), None)
-    if not entry or entry['request_token'] != oauth_token:
-        raise HTTPException(status_code=400, detail="Invalid or expired request token")
-
-    access_url = "https://secure.splitwise.com/oauth/access_token"
-    params = {
-        'oauth_consumer_key': SPLITWISE_CONSUMER_KEY,
-        'oauth_token': oauth_token,
-        'oauth_signature_method': 'PLAINTEXT',
-        'oauth_signature': f"{SPLITWISE_CONSUMER_SECRET}&",
-        'oauth_verifier': oauth_verifier
+async def callback_oauth(code: str, chat_id: int, state: str = None):
+    if state and state != str(chat_id):
+        raise HTTPException(status_code=400, detail="State mismatch")
+    token_url = "https://secure.splitwise.com/oauth/token"
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": SPLITWISE_CLIENT_ID,
+        "client_secret": SPLITWISE_CLIENT_SECRET,
+        "redirect_uri": f"{CALLBACK_BASE_URL}?chat_id={chat_id}",
+        "code": code,
     }
     async with httpx.AsyncClient() as client:
-        res = await client.post(access_url, params=params)
+        res = await client.post(token_url, data=data)
         res.raise_for_status()
-    token_data = dict(pair.split('=') for pair in res.text.split('&'))
-    set_user_token(str(chat_id), token_data['oauth_token'])
-    save_json(pending_file, pending)
+        token_data = res.json()
+    set_user_token(str(chat_id), token_data["access_token"])
     return {"status": "authorized"}
 
 # ----------- Services -----------
