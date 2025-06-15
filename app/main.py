@@ -127,8 +127,13 @@ async def callback_oauth(code: str, state: str):
     return {"status": "authorized"}
 
 # ----------- Services -----------
-async def parse_expense_from_text(text: str, friends: list, self_name: str, self_user_id: int) -> dict:
+async def parse_expense_from_text(text: str, friends: list, self_name: str, self_user_id: int, telegram_name: str = None) -> dict:
     friend_list_str = ", ".join([f"{f['first_name']} (id: {f['id']})" for f in friends])
+    self_refs = [self_name]
+    if telegram_name and telegram_name != self_name:
+        self_refs.append(telegram_name)
+    self_refs += ["me", "mine", "self"]
+    self_refs_str = ", ".join(self_refs)
     system_message = (
         "You are a financial assistant that extracts structured JSON from natural-language expense messages. "
         "Return ONLY a raw JSON object without markdown formatting or commentary. "
@@ -136,6 +141,7 @@ async def parse_expense_from_text(text: str, friends: list, self_name: str, self
     )
     user_message = (
         f'You are the user: {self_name} (id: {self_user_id}).\n'
+        f'You may refer to yourself as: {self_refs_str}.\n'
         f'Your friends are: {friend_list_str}.\n'
         f'The user sent this message: "{text}".\n'
         "Your job is to convert it into structured JSON with:\n"
@@ -145,7 +151,7 @@ async def parse_expense_from_text(text: str, friends: list, self_name: str, self
         '- participants: a list of objects with:\n'
         '    - name: participant name\n'
         '    - share: amount they owe (number or null if unspecified)\n'
-        '- description: short natural-sounding summary\n\n'
+        '- description: a concise, natural-sounding summary (max 4 words, no repetition, no generic phrases like "expense for")\n\n'
         "⚠️ Output ONLY a valid JSON object. No markdown, no extra text.\n"
         "⚠️ Ensure all amounts are numbers, not strings."
     )
@@ -160,7 +166,6 @@ async def parse_expense_from_text(text: str, friends: list, self_name: str, self
         )
         content = response.choices[0].message.content
         logging.debug(f"OpenAI response content: {content}")
-        # Remove markdown code block if present
         content = re.sub(r"^```json\\s*|^```\\s*|```$", "", content.strip(), flags=re.MULTILINE).strip()
         parsed = json.loads(content)
         return parsed
