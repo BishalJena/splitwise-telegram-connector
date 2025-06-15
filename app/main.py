@@ -312,6 +312,10 @@ async def telegram_webhook(req: Request):
         logging.debug(f"Parsed expense: {parsed}")
         normalized = normalize_expense(parsed, friends, self_user_id)
         logging.debug(f"Normalized expense: {normalized}")
+        clarification = await validate_expense_clarity(text, parsed)
+        if clarification:
+            await send_telegram_message(chat_id, f"❓ {clarification}")
+            return {"ok": True}
         res = await create_splitwise_expense(chat_id, normalized)
         logging.debug(f"Splitwise response: {res}")
         await send_telegram_message(chat_id, f"✅ Expense added: {normalized['description']} - ₹{normalized['cost']}")
@@ -367,6 +371,24 @@ app.include_router(router)
 @app.get("/")
 def root():
     return {"status": "running"}
+
+async def validate_expense_clarity(text: str, parsed: dict) -> str | None:
+    """Use OpenAI to check if the parsed expense is clear. Return a clarification question if not, else None."""
+    prompt = (
+        f"The user sent this message: '{text}'.\n"
+        f"You parsed it as: {json.dumps(parsed, ensure_ascii=False)}\n"
+        "Does this message clearly specify who paid and who owes what? "
+        "If yes, reply ONLY with 'OK'. If not, reply with a clarification question to ask the user."
+    )
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    content = response.choices[0].message.content.strip()
+    if content.upper() == "OK":
+        return None
+    return content
 
 if __name__ == "__main__":
     import uvicorn
