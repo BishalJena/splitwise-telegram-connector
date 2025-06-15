@@ -111,7 +111,9 @@ async def callback_oauth(code: str, state: str):
     }
     async with httpx.AsyncClient() as client:
         res = await client.post(token_url, data=data)
-        res.raise_for_status()
+        if res.status_code != 200:
+            print("Splitwise token error:", res.text)
+            res.raise_for_status()
         token_data = res.json()
     set_user_token(str(chat_id), token_data["access_token"])
     await send_telegram_message(chat_id, "✅ Splitwise account authorized! You can now add expenses.")
