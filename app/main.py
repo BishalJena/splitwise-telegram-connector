@@ -138,9 +138,12 @@ async def callback_oauth(oauth_token: str, oauth_verifier: str, chat_id: int):
     return {"status": "authorized"}
 
 # ----------- Services -----------
-async def parse_expense_from_text(text: str) -> dict:
+async def parse_expense_from_text(text: str, friends: list) -> dict:
+    friend_list_str = ", ".join([f"{f['first_name']} (id: {f['id']})" for f in friends])
     prompt = (
-        "Extract amount, description, paid_by and owed_by from: '{}'. Respond ONLY with a valid JSON object, no explanation.".format(text)
+        f"You are given a list of friends: {friend_list_str}. "
+        f"Extract amount, description, paid_by (name), and owed_by (list of names) from: '{text}'. "
+        "Respond ONLY with a valid JSON object, no explanation."
     )
     try:
         client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -153,8 +156,8 @@ async def parse_expense_from_text(text: str) -> dict:
 
         # Remove markdown code block if present
         content = re.sub(r"^```json\s*|^```\s*|```$", "", content.strip(), flags=re.MULTILINE).strip()
-
-        return json.loads(content)
+        parsed = json.loads(content)
+        return parsed
     except json.JSONDecodeError as e:
         logging.error(f"OpenAI returned invalid JSON: {content}")
         raise HTTPException(status_code=500, detail=f"Parsing failed: Invalid JSON returned by model: {content}")
@@ -184,6 +187,53 @@ async def create_splitwise_expense(chat_id: str, expense: dict):
     except Exception as e:
         logging.error(f"Splitwise API error: {e}")
         raise HTTPException(status_code=502, detail="Splitwise error")
+
+async def get_splitwise_friends(token: str):
+    url = "https://secure.splitwise.com/api/v3.0/get_friends"
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url, headers=headers)
+        res.raise_for_status()
+        return res.json()["friends"]
+
+def match_name_to_user_id(name, friends):
+    name = name.lower()
+    for friend in friends:
+        if name in friend["first_name"].lower() or name in friend.get("last_name", "").lower():
+            return friend["id"]
+    return None
+
+def normalize_expense(parsed, friends, self_user_id):
+    # Map paid_by and owed_by names to user_ids
+    paid_by_name = parsed.get("paid_by")
+    owed_by_names = parsed.get("owed_by", [])
+    # If paid_by is 'mine' or similar, use self_user_id
+    if isinstance(paid_by_name, str) and paid_by_name.strip().lower() in ["mine", "me", "self"]:
+        paid_by = self_user_id
+    else:
+        paid_by = match_name_to_user_id(paid_by_name, friends)
+    if paid_by is None:
+        raise HTTPException(status_code=400, detail=f"Could not match paid_by name: {paid_by_name}")
+    owed_by = []
+    for name in owed_by_names:
+        if isinstance(name, str) and name.strip().lower() in ["mine", "me", "self"]:
+            owed_by.append(self_user_id)
+        else:
+            uid = match_name_to_user_id(name, friends)
+            if uid is None:
+                raise HTTPException(status_code=400, detail=f"Could not match owed_by name: {name}")
+            owed_by.append(uid)
+    # Use 'cost' if present, else 'amount'
+    cost = parsed.get("cost") or parsed.get("amount")
+    if cost is None:
+        raise HTTPException(status_code=400, detail="No cost/amount found in parsed expense")
+    return {
+        "cost": cost,
+        "description": parsed.get("description", ""),
+        "paid_by": paid_by,
+        "owed_by": owed_by,
+        "shares": parsed.get("shares", {})
+    }
 
 # ----------- Telegram Messaging -----------
 async def send_telegram_message(chat_id: str, text: str):
@@ -225,13 +275,31 @@ async def telegram_webhook(req: Request):
             await send_telegram_message(chat_id, f"❌ OAuth start error: {e}")
         return {"ok": True}
 
-    # Handle expense
+    # Check Splitwise token before parsing
+    token = get_user_token(chat_id)
+    if not token:
+        await send_telegram_message(chat_id, "❌ User not authorized with Splitwise. Send /start to authorize.")
+        return {"ok": True}
+
     try:
-        parsed = await parse_expense_from_text(text)
+        friends = await get_splitwise_friends(token)
+        # Find self user_id
+        self_user_id = None
+        for f in friends:
+            if f.get("registration_status") == "confirmed" and f.get("id"):
+                if str(f.get("id")) == chat_id:
+                    self_user_id = f["id"]
+                    break
+        if not self_user_id and friends:
+            # fallback: use the first friend with a valid id
+            self_user_id = friends[0]["id"]
+        parsed = await parse_expense_from_text(text, friends)
         logging.debug(f"Parsed expense: {parsed}")
-        res = await create_splitwise_expense(chat_id, parsed)
+        normalized = normalize_expense(parsed, friends, self_user_id)
+        logging.debug(f"Normalized expense: {normalized}")
+        res = await create_splitwise_expense(chat_id, normalized)
         logging.debug(f"Splitwise response: {res}")
-        await send_telegram_message(chat_id, f"✅ Expense added: {parsed['description']} - ₹{parsed['cost']}")
+        await send_telegram_message(chat_id, f"✅ Expense added: {normalized['description']} - ₹{normalized['cost']}")
     except HTTPException as he:
         logging.warning(f"HTTP error: {he.detail}")
         await send_telegram_message(chat_id, f"❌ {he.detail}")
@@ -246,8 +314,22 @@ async def api_create_expense(expense: ExpenseInput, chat_id: str):
     return await create_splitwise_expense(chat_id, expense.dict())
 
 @router.post("/api/parse")
-async def api_parse_expense(payload: ParseInput):
-    return {"parsed": await parse_expense_from_text(payload.text)}
+async def api_parse_expense(payload: ParseInput, chat_id: str):
+    token = get_user_token(chat_id)
+    if not token:
+        raise HTTPException(status_code=401, detail="User not authorized with Splitwise")
+    friends = await get_splitwise_friends(token)
+    self_user_id = None
+    for f in friends:
+        if f.get("registration_status") == "confirmed" and f.get("id"):
+            if str(f.get("id")) == chat_id:
+                self_user_id = f["id"]
+                break
+    if not self_user_id and friends:
+        self_user_id = friends[0]["id"]
+    parsed = await parse_expense_from_text(payload.text, friends)
+    normalized = normalize_expense(parsed, friends, self_user_id)
+    return {"parsed": normalized}
 
 @router.post("/api/setup-webhook")
 async def setup_telegram_webhook(data: WebhookInput):
