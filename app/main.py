@@ -188,7 +188,9 @@ async def get_splitwise_friends(token: str):
 def match_name_to_user_id(name, friends):
     name = name.lower()
     for friend in friends:
-        if name in friend["first_name"].lower() or name in friend.get("last_name", "").lower():
+        first = (friend.get("first_name") or "").lower()
+        last = (friend.get("last_name") or "").lower()
+        if name in first or name in last:
             return friend["id"]
     return None
 
