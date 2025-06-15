@@ -127,24 +127,41 @@ async def callback_oauth(code: str, state: str):
     return {"status": "authorized"}
 
 # ----------- Services -----------
-async def parse_expense_from_text(text: str, friends: list) -> dict:
+async def parse_expense_from_text(text: str, friends: list, self_name: str, self_user_id: int) -> dict:
     friend_list_str = ", ".join([f"{f['first_name']} (id: {f['id']})" for f in friends])
-    prompt = (
-        f"You are given a list of friends: {friend_list_str}. "
-        f"Extract amount, description, paid_by (name), and owed_by (list of names) from: '{text}'. "
-        "Respond ONLY with a valid JSON object, no explanation."
+    system_message = (
+        "You are a financial assistant that extracts structured JSON from natural-language expense messages. "
+        "Return ONLY a raw JSON object without markdown formatting or commentary. "
+        "Ensure all amounts are numbers, not strings."
+    )
+    user_message = (
+        f'You are the user: {self_name} (id: {self_user_id}).\n'
+        f'Your friends are: {friend_list_str}.\n'
+        f'The user sent this message: "{text}".\n'
+        "Your job is to convert it into structured JSON with:\n"
+        '- amount: total expense amount (number)\n'
+        '- currency: currency code (e.g., "INR")\n'
+        '- payer: who paid (name or "me")\n'
+        '- participants: a list of objects with:\n'
+        '    - name: participant name\n'
+        '    - share: amount they owe (number or null if unspecified)\n'
+        '- description: short natural-sounding summary\n\n'
+        "⚠️ Output ONLY a valid JSON object. No markdown, no extra text.\n"
+        "⚠️ Ensure all amounts are numbers, not strings."
     )
     try:
         client = openai.OpenAI(api_key=OPENAI_API_KEY)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}]
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_message}
+            ]
         )
         content = response.choices[0].message.content
         logging.debug(f"OpenAI response content: {content}")
-
         # Remove markdown code block if present
-        content = re.sub(r"^```json\s*|^```\s*|```$", "", content.strip(), flags=re.MULTILINE).strip()
+        content = re.sub(r"^```json\\s*|^```\\s*|```$", "", content.strip(), flags=re.MULTILINE).strip()
         parsed = json.loads(content)
         return parsed
     except json.JSONDecodeError as e:
@@ -195,35 +212,40 @@ def match_name_to_user_id(name, friends):
     return None
 
 def normalize_expense(parsed, friends, self_user_id):
-    # Map paid_by and owed_by names to user_ids
-    paid_by_name = parsed.get("paid_by")
-    owed_by_names = parsed.get("owed_by", [])
-    # If paid_by is 'mine' or similar, use self_user_id
-    if isinstance(paid_by_name, str) and paid_by_name.strip().lower() in ["mine", "me", "self"]:
+    # Map payer and participants names to user_ids
+    payer_name = parsed.get("payer")
+    participants = parsed.get("participants", [])
+    # If payer is 'me', use self_user_id
+    if isinstance(payer_name, str) and payer_name.strip().lower() in ["mine", "me", "self"]:
         paid_by = self_user_id
     else:
-        paid_by = match_name_to_user_id(paid_by_name, friends)
+        paid_by = match_name_to_user_id(payer_name, friends)
     if paid_by is None:
-        raise HTTPException(status_code=400, detail=f"Could not match paid_by name: {paid_by_name}")
+        raise HTTPException(status_code=400, detail=f"Could not match payer name: {payer_name}")
     owed_by = []
-    for name in owed_by_names:
+    shares = {}
+    for part in participants:
+        name = part.get("name")
+        share = part.get("share")
         if isinstance(name, str) and name.strip().lower() in ["mine", "me", "self"]:
-            owed_by.append(self_user_id)
+            uid = self_user_id
         else:
             uid = match_name_to_user_id(name, friends)
-            if uid is None:
-                raise HTTPException(status_code=400, detail=f"Could not match owed_by name: {name}")
-            owed_by.append(uid)
-    # Use 'cost' if present, else 'amount'
-    cost = parsed.get("cost") or parsed.get("amount")
+        if uid is None:
+            raise HTTPException(status_code=400, detail=f"Could not match participant name: {name}")
+        owed_by.append(uid)
+        if share is not None:
+            shares[str(uid)] = share
+    cost = parsed.get("amount")
     if cost is None:
-        raise HTTPException(status_code=400, detail="No cost/amount found in parsed expense")
+        raise HTTPException(status_code=400, detail="No amount found in parsed expense")
     return {
         "cost": cost,
         "description": parsed.get("description", ""),
         "paid_by": paid_by,
         "owed_by": owed_by,
-        "shares": parsed.get("shares", {})
+        "shares": shares,
+        "currency_code": parsed.get("currency", "INR")
     }
 
 # ----------- Telegram Messaging -----------
@@ -274,17 +296,19 @@ async def telegram_webhook(req: Request):
 
     try:
         friends = await get_splitwise_friends(token)
-        # Find self user_id
+        # Find self user_id and name
         self_user_id = None
+        self_name = None
         for f in friends:
             if f.get("registration_status") == "confirmed" and f.get("id"):
                 if str(f.get("id")) == chat_id:
                     self_user_id = f["id"]
+                    self_name = f.get("first_name", "Me")
                     break
         if not self_user_id and friends:
-            # fallback: use the first friend with a valid id
             self_user_id = friends[0]["id"]
-        parsed = await parse_expense_from_text(text, friends)
+            self_name = friends[0].get("first_name", "Me")
+        parsed = await parse_expense_from_text(text, friends, self_name, self_user_id)
         logging.debug(f"Parsed expense: {parsed}")
         normalized = normalize_expense(parsed, friends, self_user_id)
         logging.debug(f"Normalized expense: {normalized}")
@@ -311,14 +335,17 @@ async def api_parse_expense(payload: ParseInput, chat_id: str):
         raise HTTPException(status_code=401, detail="User not authorized with Splitwise")
     friends = await get_splitwise_friends(token)
     self_user_id = None
+    self_name = None
     for f in friends:
         if f.get("registration_status") == "confirmed" and f.get("id"):
             if str(f.get("id")) == chat_id:
                 self_user_id = f["id"]
+                self_name = f.get("first_name", "Me")
                 break
     if not self_user_id and friends:
         self_user_id = friends[0]["id"]
-    parsed = await parse_expense_from_text(payload.text, friends)
+        self_name = friends[0].get("first_name", "Me")
+    parsed = await parse_expense_from_text(payload.text, friends, self_name, self_user_id)
     normalized = normalize_expense(parsed, friends, self_user_id)
     return {"parsed": normalized}
 
