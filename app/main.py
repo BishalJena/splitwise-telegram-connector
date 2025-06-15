@@ -91,7 +91,7 @@ async def start_oauth(chat_id: int):
     params = {
         "client_id": SPLITWISE_CLIENT_ID,
         "response_type": "code",
-        "redirect_uri": f"{CALLBACK_BASE_URL}?chat_id={chat_id}",
+        "redirect_uri": f"{CALLBACK_BASE_URL}",
         "scope": "",  # Splitwise does not use scopes, but keep for spec compliance
         "state": str(chat_id)
     }
@@ -99,15 +99,14 @@ async def start_oauth(chat_id: int):
     return {"auth_url": auth_url}
 
 @router.get("/auth/splitwise/callback")
-async def callback_oauth(code: str, chat_id: int, state: str = None):
-    if state and state != str(chat_id):
-        raise HTTPException(status_code=400, detail="State mismatch")
+async def callback_oauth(code: str, state: str):
+    chat_id = state  # Use state as chat_id
     token_url = "https://secure.splitwise.com/oauth/token"
     data = {
         "grant_type": "authorization_code",
         "client_id": SPLITWISE_CLIENT_ID,
         "client_secret": SPLITWISE_CLIENT_SECRET,
-        "redirect_uri": f"{CALLBACK_BASE_URL}?chat_id={chat_id}",
+        "redirect_uri": f"{CALLBACK_BASE_URL}",
         "code": code,
     }
     async with httpx.AsyncClient() as client:
@@ -115,6 +114,7 @@ async def callback_oauth(code: str, chat_id: int, state: str = None):
         res.raise_for_status()
         token_data = res.json()
     set_user_token(str(chat_id), token_data["access_token"])
+    await send_telegram_message(chat_id, "✅ Splitwise account authorized! You can now add expenses.")
     return {"status": "authorized"}
 
 # ----------- Services -----------
