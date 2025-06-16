@@ -50,6 +50,9 @@ app = FastAPI(
 )
 router = APIRouter()
 
+# Add at the top with other global variables
+pending_expenses = {}
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -284,6 +287,7 @@ async def send_telegram_message(chat_id: str, text: str):
 # ----------- Telegram Webhook -----------
 @router.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
+    global pending_expenses
     logging.debug("Received webhook call")
     try:
         payload = await req.json()
@@ -317,6 +321,22 @@ async def telegram_webhook(req: Request):
         return {"ok": True}
 
     try:
+        # Check if this is a clarification response
+        if chat_id in pending_expenses:
+            # This is a response to a clarification question
+            pending = pending_expenses[chat_id]
+            if text.lower() in ["i did", "me", "mine", "self"]:
+                # User confirmed they paid
+                pending["parsed"]["payer"] = "me"
+                normalized = normalize_expense(pending["parsed"], pending["friends"], token["splitwise_id"])
+                del pending_expenses[chat_id]  # Clear pending expense
+                res = await create_splitwise_expense(chat_id, normalized)
+                await send_telegram_message(chat_id, f"✅ Expense added: {normalized['description']} - ₹{normalized['cost']}")
+                return {"ok": True}
+            else:
+                # User provided a different response, treat as new expense
+                del pending_expenses[chat_id]
+
         friends = await get_splitwise_friends(token["access_token"])
         parsed = await parse_expense_from_text(text, friends, token["splitwise_name"], token["splitwise_id"])
         logging.debug(f"Parsed expense: {parsed}")
@@ -324,6 +344,11 @@ async def telegram_webhook(req: Request):
         logging.debug(f"Normalized expense: {normalized}")
         clarification = await validate_expense_clarity(text, parsed)
         if clarification:
+            # Store the pending expense context
+            pending_expenses[chat_id] = {
+                "parsed": parsed,
+                "friends": friends
+            }
             await send_telegram_message(chat_id, f"❓ {clarification}")
             return {"ok": True}
         res = await create_splitwise_expense(chat_id, normalized)
@@ -372,22 +397,21 @@ def root():
     return {"status": "running"}
 
 async def validate_expense_clarity(text: str, parsed: dict) -> str | None:
-    """Use OpenAI to check if the parsed expense is clear. Return a clarification question if not, else None."""
-    prompt = (
-        f"The user sent this message: '{text}'.\n"
-        f"You parsed it as: {json.dumps(parsed, ensure_ascii=False)}\n"
-        "Does this message clearly specify who paid and who owes what? "
-        "If yes, reply ONLY with 'OK'. If not, reply with a clarification question to ask the user."
-    )
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    content = response.choices[0].message.content.strip()
-    if content.upper() == "OK":
+    try:
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "user", "content": f'The user sent this message: \'{text}\'.\nYou parsed it as: {json.dumps(parsed)}\nDoes this message clearly specify who paid and who owes what? If yes, reply ONLY with \'OK\'. If not, reply with a clarification question to ask the user.'}
+            ]
+        )
+        content = response.choices[0].message.content.strip()
+        if content == "OK":
+            return None
+        return content
+    except Exception as e:
+        logging.error(f"Clarity validation error: {e}")
         return None
-    return content
 
 if __name__ == "__main__":
     import uvicorn
