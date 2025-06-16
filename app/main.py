@@ -76,14 +76,27 @@ def save_json(fname, data):
     with open(fname, 'w') as f:
         json.dump(data, f)
 
-def get_user_token(chat_id: str) -> str | None:
+def get_user_token(chat_id: str) -> dict | None:
     tokens = load_json(tokens_file)
     return tokens.get(chat_id)
 
-def set_user_token(chat_id: str, access_token: str):
+def set_user_token(chat_id: str, access_token: str, splitwise_id: int, splitwise_name: str):
     tokens = load_json(tokens_file)
-    tokens[chat_id] = access_token
+    tokens[chat_id] = {
+        "access_token": access_token,
+        "splitwise_id": splitwise_id,
+        "splitwise_name": splitwise_name
+    }
     save_json(tokens_file, tokens)
+
+# ----------- Splitwise User Info Helper -----------
+async def get_splitwise_current_user(token: str):
+    url = "https://secure.splitwise.com/api/v3.0/get_current_user"
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url, headers=headers)
+        res.raise_for_status()
+        return res.json()["user"]
 
 # ----------- Splitwise OAuth 2.0 Flow -----------
 @router.get("/auth/splitwise/start")
@@ -122,7 +135,11 @@ async def callback_oauth(code: str, state: str):
     if "access_token" not in token_data:
         logging.error(f"Splitwise token response missing access_token: {token_data}")
         raise HTTPException(status_code=502, detail="Splitwise token response missing access_token")
-    set_user_token(str(chat_id), token_data["access_token"])
+    # Fetch Splitwise user info
+    user_info = await get_splitwise_current_user(token_data["access_token"])
+    splitwise_id = user_info["id"]
+    splitwise_name = user_info.get("first_name", "Me")
+    set_user_token(str(chat_id), token_data["access_token"], splitwise_id, splitwise_name)
     await send_telegram_message(chat_id, "✅ Splitwise account authorized! You can now add expenses.")
     return {"status": "authorized"}
 
@@ -181,7 +198,7 @@ async def create_splitwise_expense(chat_id: str, expense: dict):
     if not token:
         raise HTTPException(status_code=401, detail="User not authorized with Splitwise")
     url = "https://secure.splitwise.com/api/v3.0/create_expense"
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {token['access_token']}"}
     # Build payload
     data = {"cost": expense["cost"], "description": expense["description"], "currency_code": expense.get("currency_code", "INR")}
     data.update({"users__0__user_id": expense["paid_by"], "users__0__paid_share": expense["cost"]})
@@ -300,22 +317,10 @@ async def telegram_webhook(req: Request):
         return {"ok": True}
 
     try:
-        friends = await get_splitwise_friends(token)
-        # Find self user_id and name
-        self_user_id = None
-        self_name = None
-        for f in friends:
-            if f.get("registration_status") == "confirmed" and f.get("id"):
-                if str(f.get("id")) == chat_id:
-                    self_user_id = f["id"]
-                    self_name = f.get("first_name", "Me")
-                    break
-        if not self_user_id and friends:
-            self_user_id = friends[0]["id"]
-            self_name = friends[0].get("first_name", "Me")
-        parsed = await parse_expense_from_text(text, friends, self_name, self_user_id)
+        friends = await get_splitwise_friends(token["access_token"])
+        parsed = await parse_expense_from_text(text, friends, token["splitwise_name"], token["splitwise_id"])
         logging.debug(f"Parsed expense: {parsed}")
-        normalized = normalize_expense(parsed, friends, self_user_id)
+        normalized = normalize_expense(parsed, friends, token["splitwise_id"])
         logging.debug(f"Normalized expense: {normalized}")
         clarification = await validate_expense_clarity(text, parsed)
         if clarification:
@@ -342,20 +347,9 @@ async def api_parse_expense(payload: ParseInput, chat_id: str):
     token = get_user_token(chat_id)
     if not token:
         raise HTTPException(status_code=401, detail="User not authorized with Splitwise")
-    friends = await get_splitwise_friends(token)
-    self_user_id = None
-    self_name = None
-    for f in friends:
-        if f.get("registration_status") == "confirmed" and f.get("id"):
-            if str(f.get("id")) == chat_id:
-                self_user_id = f["id"]
-                self_name = f.get("first_name", "Me")
-                break
-    if not self_user_id and friends:
-        self_user_id = friends[0]["id"]
-        self_name = friends[0].get("first_name", "Me")
-    parsed = await parse_expense_from_text(payload.text, friends, self_name, self_user_id)
-    normalized = normalize_expense(parsed, friends, self_user_id)
+    friends = await get_splitwise_friends(token["access_token"])
+    parsed = await parse_expense_from_text(payload.text, friends, token["splitwise_name"], token["splitwise_id"])
+    normalized = normalize_expense(parsed, friends, token["splitwise_id"])
     return {"parsed": normalized}
 
 @router.post("/api/setup-webhook")
