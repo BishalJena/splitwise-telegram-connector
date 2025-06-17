@@ -7,4 +7,6 @@ pending_oauth.json
 .idea/
 .vscode/
 .pytest_cache/
-
+.cursorrules
+.cursorignore
+.gitignore

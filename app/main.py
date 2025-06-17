@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 import traceback
 import re
 import asyncio
+from typing import Optional
 
 # Load environment variables
 load_dotenv()
@@ -157,6 +158,7 @@ async def parse_expense_from_text(text: str, friends: list, self_name: str, self
     self_refs_str = ", ".join(self_refs)
     system_message = (
         "You are a financial assistant that extracts structured JSON from natural-language expense messages. "
+        "You must handle both ratio-based splits (e.g., '1:1:2 split') and exact amount splits. "
         "Return ONLY a raw JSON object without markdown formatting or commentary. "
         "Ensure all amounts are numbers, not strings."
     )
@@ -172,8 +174,26 @@ async def parse_expense_from_text(text: str, friends: list, self_name: str, self
         '- payer: who paid (name or "me")\n'
         '- participants: a list of objects with:\n'
         '    - name: participant name\n'
-        '    - share: amount they owe (number or null if unspecified)\n'
+        '    - share: amount they owe (number)\n'
         '- description: a concise, natural-sounding summary (max 4 words, no repetition, no generic phrases like "expense for")\n\n'
+        "For exact amount splits (e.g., 'split 323 to John and rest to me'):\n"
+        "1. Assign the specified amount to the participant\n"
+        "2. Calculate the remaining amount for unspecified shares\n"
+        "3. Ensure shares sum up to the total amount\n\n"
+        "For ratio splits (e.g., '1:1:2 split'):\n"
+        "1. Calculate total parts (e.g., 1+1+2 = 4)\n"
+        "2. Calculate share per part (total_amount/total_parts)\n"
+        "3. Multiply each person's share by their ratio\n\n"
+        "Examples:\n"
+        "1. '1253 rupees, split 323 to John and rest to me':\n"
+        "   - John's share = 323\n"
+        "   - My share = 1253 - 323 = 930\n\n"
+        "2. '100 with 1:1:2 split':\n"
+        "   - Total parts = 4\n"
+        "   - Share per part = 25\n"
+        "   - First person = 25\n"
+        "   - Second person = 25\n"
+        "   - Third person = 50\n\n"
         "⚠️ Output ONLY a valid JSON object. No markdown, no extra text.\n"
         "⚠️ Ensure all amounts are numbers, not strings."
     )
@@ -204,14 +224,29 @@ async def create_splitwise_expense(chat_id: str, expense: dict):
         raise HTTPException(status_code=401, detail="User not authorized with Splitwise")
     url = "https://secure.splitwise.com/api/v3.0/create_expense"
     headers = {"Authorization": f"Bearer {token['access_token']}"}
+    
     # Build payload
-    data = {"cost": expense["cost"], "description": expense["description"], "currency_code": expense.get("currency_code", "INR")}
-    data.update({"users__0__user_id": expense["paid_by"], "users__0__paid_share": expense["cost"]})
-    equal = round(expense["cost"]/len(expense["owed_by"]), 2)
+    data = {
+        "cost": expense["cost"],
+        "description": expense["description"],
+        "currency_code": expense.get("currency_code", "INR")
+    }
+    
+    # Handle paid shares and owed shares
     for i, uid in enumerate(expense["owed_by"]):
         data[f"users__{i}__user_id"] = uid
-        share = expense.get("shares", {}).get(str(uid), equal)
-        data[f"users__{i}__owed_share"] = share
+        # Set paid share
+        if uid == expense["paid_by"]:
+            data[f"users__{i}__paid_share"] = "{:.2f}".format(float(expense["cost"]))
+        else:
+            data[f"users__{i}__paid_share"] = "0.00"
+        
+        # Get owed share from shares dict or calculate equal split
+        share = expense.get("shares", {}).get(str(uid))
+        if share is None:
+            share = expense["cost"] / len(expense["owed_by"])
+        data[f"users__{i}__owed_share"] = "{:.2f}".format(float(share))
+
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post(url, data=data, headers=headers)
@@ -337,38 +372,40 @@ async def telegram_webhook(req: Request):
             await send_telegram_message(chat_id, f"❌ OAuth start error: {e}")
         return {"ok": True}
 
-    # Check Splitwise token before parsing
+    # Check Splitwise token before proceeding
     token = get_user_token(chat_id)
     if not token:
         await send_telegram_message(chat_id, "❌ User not authorized with Splitwise. Send /start to authorize.")
         return {"ok": True}
 
-    # --- Hybrid Command Parsing ---
-    parsed = parse_command_regex(text)
-    if parsed:
-        vetted = await vet_command_with_llm(text, parsed)
-        if vetted.get("command") and vetted["command"] != "unknown":
-            cmd = vetted["command"]
+    # First check if it's a command
+    command_data = parse_command_regex(text)
+    if command_data:
+        try:
+            cmd = command_data["command"]
             if cmd == "show_recent_expenses":
                 await handle_show_recent_expenses(chat_id, token)
             elif cmd == "show_expenses_by_category":
-                await handle_show_expenses_by_category(chat_id, token, vetted.get("category"))
+                await handle_show_expenses_by_category(chat_id, token, command_data.get("category"))
             elif cmd == "show_expenses_with_friend":
-                await handle_show_expenses_with_friend(chat_id, token, vetted.get("friend"))
+                await handle_show_expenses_with_friend(chat_id, token, command_data.get("friend"))
             elif cmd == "show_balance_with_friend":
-                await handle_show_balance_with_friend(chat_id, token, vetted.get("friend"))
+                await handle_show_balance_with_friend(chat_id, token, command_data.get("friend"))
             elif cmd == "show_balances":
                 await handle_show_balances(chat_id, token)
             elif cmd == "delete_expense":
-                await handle_delete_expense(chat_id, token, vetted.get("expense_id"))
+                await handle_delete_expense(chat_id, token, command_data.get("expense_id"))
             elif cmd == "help":
                 await handle_help(chat_id)
             else:
                 await send_telegram_message(chat_id, "❌ Command recognized but not implemented.")
             return {"ok": True}
-        elif vetted.get("command") == "unknown":
-            await send_telegram_message(chat_id, "❌ Sorry, I couldn't understand your command. Please try again or use /help.")
+        except Exception as e:
+            logging.exception("Command handling error")
+            await send_telegram_message(chat_id, f"❌ Error executing command: {str(e)}")
             return {"ok": True}
+
+    # If not a command, try to parse as an expense
     try:
         friends = await get_splitwise_friends(token["access_token"])
         parsed = await parse_expense_from_text(text, friends, token["splitwise_name"], token["splitwise_id"])
@@ -382,8 +419,8 @@ async def telegram_webhook(req: Request):
         logging.warning(f"HTTP error: {he.detail}")
         await send_telegram_message(chat_id, f"❌ {he.detail}")
     except Exception as e:
-        logging.exception("Webhook handling error")
-        await send_telegram_message(chat_id, "❌ Internal error")
+        logging.exception("Expense handling error")
+        await send_telegram_message(chat_id, "❌ Error processing expense. Please check your message format.")
     return {"ok": True}
 
 # ----------- Additional API Endpoints -----------
@@ -438,35 +475,37 @@ async def validate_expense_clarity(text: str, parsed: dict) -> str | None:
         logging.error(f"Clarity validation error: {e}")
         return None
 
-def parse_command_regex(text):
-    text = text.strip().lower()
-    # 1. Show recent expenses
-    if re.match(r"show (me )?recent expenses", text):
-        return {"command": "show_recent_expenses"}
-    # 2. Show expenses by category
-    m = re.match(r"show (me )?(?P<category>\w+) expenses", text)
-    if m:
-        return {"command": "show_expenses_by_category", "category": m.group("category")}
-    # 3. Show expenses with a friend
-    m = re.match(r"show (me )?expenses with (?P<friend>[\w ]+)", text)
-    if m:
-        return {"command": "show_expenses_with_friend", "friend": m.group("friend").strip()}
-    # 4. Show balance with a friend
-    m = re.match(r"how much do i owe (?P<friend>[\w ]+)", text)
-    if m:
-        return {"command": "show_balance_with_friend", "friend": m.group("friend").strip()}
-    # 5. Show total owed/owing
-    if re.match(r"show (me )?my balances", text):
+def parse_command_regex(text: str) -> Optional[dict]:
+    """Parse command patterns from text message"""
+    # Direct commands
+    if text.startswith("/"):
+        command = text[1:].split()[0].lower()
+        return {"command": command}
+
+    # Show balances
+    if re.match(r"^(show|get)\s+balances?$", text, re.I):
         return {"command": "show_balances"}
-    # 6. Delete an expense
-    m = re.match(r"delete expense #(\d+)", text)
-    if m:
-        return {"command": "delete_expense", "expense_id": int(m.group(1))}
-    if re.match(r"delete last expense", text):
-        return {"command": "delete_expense", "expense_id": None}
-    # 8. Help
-    if text.startswith("/help") or text == "help":
-        return {"command": "help"}
+
+    # Show balance with friend
+    friend_balance = re.match(r"^(show|get|how\s+much)\s+(balance|do\s+i\s+owe)\s+(?:with\s+)?(\w+)$", text, re.I)
+    if friend_balance:
+        return {
+            "command": "show_balance_with_friend",
+            "friend": friend_balance.group(3)
+        }
+
+    # Show expenses by category
+    category_match = re.match(r"^show\s+(?:me\s+)?(\w+)\s+expenses$", text, re.I)
+    if category_match:
+        return {
+            "command": "show_expenses_by_category",
+            "category": category_match.group(1)
+        }
+
+    # Delete expense
+    if re.match(r"^delete\s+(?:the\s+)?last\s+expense$", text, re.I):
+        return {"command": "delete_expense"}
+
     return None
 
 async def vet_command_with_llm(text, parsed_command):
@@ -598,115 +637,155 @@ async def handle_show_expenses_with_friend(chat_id, token, friend):
     except Exception as e:
         await send_telegram_message(chat_id, f"❌ Failed to fetch expenses with '{friend}': {e}")
 
-async def handle_show_balance_with_friend(chat_id, token, friend):
-    friends_url = "https://secure.splitwise.com/api/v3.0/get_friends"
-    headers = {"Authorization": f"Bearer {token['access_token']}"}
-    try:
-        async with httpx.AsyncClient() as client:
-            friends_res = await client.get(friends_url, headers=headers)
-            friends_res.raise_for_status()
-            friends = friends_res.json().get("friends", [])
-            friend_name = friend.lower()
-            matches = [f for f in friends if friend_name in (f.get("first_name") or "").lower() or friend_name in (f.get("last_name") or "").lower()]
-            if not matches:
-                await send_telegram_message(chat_id, f"❌ Friend '{friend}' not found.")
-                return
-            if len(matches) > 1:
-                names = ', '.join([f.get('first_name', '') for f in matches])
-                await send_telegram_message(chat_id, f"Multiple friends match '{friend}': {names}. Please be more specific.")
-                return
-            friend_obj = matches[0]
-            balances = friend_obj.get("balance", [])
-            if not balances:
-                await send_telegram_message(chat_id, f"No balance found with '{friend_obj.get('first_name','')}'.")
-                return
-            msg_lines = []
-            for b in balances:
-                amount = float(b.get("amount", "0"))
-                currency = b.get("currency_code", "")
-                if amount > 0:
-                    msg_lines.append(f"You are owed {amount:.2f} {currency} by {friend_obj.get('first_name','')}.")
-                elif amount < 0:
-                    msg_lines.append(f"You owe {abs(amount):.2f} {currency} to {friend_obj.get('first_name','')}.")
-                else:
-                    msg_lines.append(f"You and {friend_obj.get('first_name','')} are settled up in {currency}.")
-            msg = "\n".join(msg_lines)
-            await send_telegram_message(chat_id, msg)
-    except Exception as e:
-        await send_telegram_message(chat_id, f"❌ Failed to fetch balance with '{friend}': {e}")
+async def handle_show_balances(chat_id: str, token: dict):
+    """Handle showing all balances"""
+    friends = await get_splitwise_friends(token["access_token"])
+    if not friends:
+        await send_telegram_message(chat_id, "No friends found.")
+        return
 
-async def handle_show_balances(chat_id, token):
-    friends_url = "https://secure.splitwise.com/api/v3.0/get_friends"
-    headers = {"Authorization": f"Bearer {token['access_token']}"}
-    try:
-        async with httpx.AsyncClient() as client:
-            friends_res = await client.get(friends_url, headers=headers)
-            friends_res.raise_for_status()
-            friends = friends_res.json().get("friends", [])
-            totals_owed = {}
-            totals_owes = {}
-            for f in friends:
-                for b in f.get("balance", []):
-                    amount = float(b.get("amount", "0"))
-                    currency = b.get("currency_code", "")
-                    if amount > 0:
-                        totals_owed[currency] = totals_owed.get(currency, 0) + amount
-                    elif amount < 0:
-                        totals_owes[currency] = totals_owes.get(currency, 0) + abs(amount)
-            msg_lines = []
-            if totals_owed:
-                for currency, amt in totals_owed.items():
-                    msg_lines.append(f"You are owed {amt:.2f} {currency}")
-            if totals_owes:
-                for currency, amt in totals_owes.items():
-                    msg_lines.append(f"You owe {amt:.2f} {currency}")
-            if not msg_lines:
-                msg_lines.append("You are all settled up with everyone!")
-            msg = "Your balances summary:\n" + "\n".join(msg_lines)
-            await send_telegram_message(chat_id, msg)
-    except Exception as e:
-        await send_telegram_message(chat_id, f"❌ Failed to fetch balances summary: {e}")
+    message = "💰 Your balances:\n\n"
+    for friend in friends:
+        balance = friend.get("balance", [{}])[0].get("amount", "0")
+        name = f"{friend.get('first_name', '')} {friend.get('last_name', '')}".strip()
+        if float(balance) != 0:
+            symbol = "🔴" if float(balance) < 0 else "🟢"
+            message += f"{symbol} {name}: {format_amount(balance)}\n"
+    
+    await send_telegram_message(chat_id, message)
 
-async def handle_delete_expense(chat_id, token, expense_id):
-    headers = {"Authorization": f"Bearer {token['access_token']}"}
-    try:
-        async with httpx.AsyncClient() as client:
-            if expense_id is None:
-                exp_url = "https://secure.splitwise.com/api/v3.0/get_expenses"
-                exp_res = await client.get(exp_url, headers=headers, params={"limit": 1})
-                exp_res.raise_for_status()
-                expenses = exp_res.json().get("expenses", [])
-                if not expenses:
-                    await send_telegram_message(chat_id, "No expenses found to delete.")
-                    return
-                expense_id = expenses[0].get("id")
-                if not expense_id:
-                    await send_telegram_message(chat_id, "Could not determine expense ID to delete.")
-                    return
-            del_url = f"https://secure.splitwise.com/api/v3.0/delete_expense/{expense_id}"
-            del_res = await client.post(del_url, headers=headers)
-            del_res.raise_for_status()
-            result = del_res.json()
-            if result.get("success"):
-                await send_telegram_message(chat_id, f"✅ Expense #{expense_id} deleted.")
-            else:
-                await send_telegram_message(chat_id, f"❌ Failed to delete expense #{expense_id}.")
-    except Exception as e:
-        await send_telegram_message(chat_id, f"❌ Error deleting expense: {e}")
+async def handle_show_balance_with_friend(chat_id: str, token: dict, friend_name: str):
+    """Handle showing balance with specific friend"""
+    if not friend_name:
+        await send_telegram_message(chat_id, "Please specify a friend's name.")
+        return
 
-async def handle_help(chat_id):
-    help_text = (
-        "Available commands:\n"
-        "- show me recent expenses\n"
-        "- show me <category> expenses\n"
-        "- show expenses with <friend>\n"
-        "- how much do I owe <friend>\n"
-        "- show my balances\n"
-        "- delete expense #<id>\n"
-        "- delete last expense\n"
-        "- /help\n"
-        "Or just send an expense description to add it!"
-    )
+    friends = await get_splitwise_friends(token["access_token"])
+    friend = next((f for f in friends if friend_name.lower() in f["first_name"].lower()), None)
+    
+    if not friend:
+        await send_telegram_message(chat_id, f"Friend '{friend_name}' not found.")
+        return
+
+    balance = friend.get("balance", [{}])[0].get("amount", "0")
+    name = f"{friend.get('first_name', '')} {friend.get('last_name', '')}".strip()
+    
+    if float(balance) == 0:
+        message = f"👌 You're all settled with {name}!"
+    elif float(balance) < 0:
+        message = f"🔴 You owe {name}: {format_amount(abs(float(balance)))}"
+    else:
+        message = f"🟢 {name} owes you: {format_amount(balance)}"
+    
+    await send_telegram_message(chat_id, message)
+
+async def handle_show_expenses_by_category(chat_id: str, token: dict, category: str):
+    """Handle showing expenses by category"""
+    if not category:
+        await send_telegram_message(chat_id, "Please specify a category.")
+        return
+
+    # Get all categories first
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            "https://secure.splitwise.com/api/v3.0/get_categories",
+            headers={"Authorization": f"Bearer {token['access_token']}"}
+        )
+        res.raise_for_status()
+        categories = res.json().get("categories", [])
+
+    # Find matching category
+    category_lower = category.lower()
+    matched_category = None
+    for cat in categories:
+        if category_lower in cat["name"].lower():
+            matched_category = cat
+            break
+        for subcat in cat.get("subcategories", []):
+            if category_lower in subcat["name"].lower():
+                matched_category = subcat
+                break
+        if matched_category:
+            break
+
+    if not matched_category:
+        await send_telegram_message(chat_id, f"Category '{category}' not found.")
+        return
+
+    # Get expenses for this category
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            "https://secure.splitwise.com/api/v3.0/get_expenses",
+            params={"limit": 10, "category_id": matched_category["id"]},
+            headers={"Authorization": f"Bearer {token['access_token']}"}
+        )
+        res.raise_for_status()
+        expenses = res.json().get("expenses", [])
+
+    if not expenses:
+        await send_telegram_message(chat_id, f"No recent expenses found in category '{matched_category['name']}'.")
+        return
+
+    message = f"📊 Recent {matched_category['name']} expenses:\n\n"
+    for exp in expenses:
+        date = exp.get("date", "").split("T")[0]
+        message += f"• {date} - {exp.get('description')}: {format_amount(exp.get('cost'))}\n"
+    
+    await send_telegram_message(chat_id, message)
+
+async def handle_delete_expense(chat_id: str, token: dict, expense_id: Optional[int] = None):
+    """Handle deleting an expense"""
+    # Get most recent expense if no ID provided
+    if not expense_id:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
+                "https://secure.splitwise.com/api/v3.0/get_expenses",
+                params={"limit": 1},
+                headers={"Authorization": f"Bearer {token['access_token']}"}
+            )
+            res.raise_for_status()
+            expenses = res.json().get("expenses", [])
+            if not expenses:
+                await send_telegram_message(chat_id, "No recent expenses found.")
+                return
+            expense_id = expenses[0]["id"]
+
+    # Delete the expense
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            f"https://secure.splitwise.com/api/v3.0/delete_expense/{expense_id}",
+            headers={"Authorization": f"Bearer {token['access_token']}"}
+        )
+        res.raise_for_status()
+        
+    await send_telegram_message(chat_id, "✅ Expense deleted successfully!")
+
+async def handle_help(chat_id: str):
+    """Handle help command"""
+    help_text = """
+🤖 Available commands:
+
+• Create expense:
+  "I paid [amount] for [description], split between [names]"
+  Example: "I paid 100 for lunch, split between John and me"
+
+• Custom splits:
+  - Equal split: "split equally"
+  - Ratio split: "1:2:1 split between A, B, C"
+  - Exact split: "A pays 30, B pays 20"
+
+• Show balances:
+  - "show balances"
+  - "how much do I owe [name]"
+
+• Manage expenses:
+  - "show [category] expenses"
+  - "delete last expense"
+
+• Other commands:
+  - /start - Connect Splitwise
+  - /help - Show this help
+"""
     await send_telegram_message(chat_id, help_text)
 
 if __name__ == "__main__":
