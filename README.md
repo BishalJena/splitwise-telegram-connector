@@ -39,7 +39,7 @@ PORT=8000
 ### Installation
 1. Clone the repository:
    ```bash
-   git clone https://github.com/BishalJena/splitwise-telegram-connector.git
+   git clone https://github.com/yourusername/splitwise-telegram-connector.git
    cd splitwise-telegram-connector
    ```
 
@@ -69,7 +69,7 @@ PORT=8000
 
 Or simply send an expense description to add it, for example:
 - "paid 500 for lunch"
-- "paid 1000 for dinner with <friend1> and <friend2>"
+- "paid 1000 for dinner with John and Alice"
 
 ## Development
 

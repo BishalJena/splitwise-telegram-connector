@@ -157,7 +157,6 @@ async def parse_expense_from_text(text: str, friends: list, self_name: str, self
     self_refs_str = ", ".join(self_refs)
     system_message = (
         "You are a financial assistant that extracts structured JSON from natural-language expense messages. "
-        "You must handle both ratio-based splits (e.g., '1:1:2 split') and exact amount splits. "
         "Return ONLY a raw JSON object without markdown formatting or commentary. "
         "Ensure all amounts are numbers, not strings."
     )
@@ -173,26 +172,8 @@ async def parse_expense_from_text(text: str, friends: list, self_name: str, self
         '- payer: who paid (name or "me")\n'
         '- participants: a list of objects with:\n'
         '    - name: participant name\n'
-        '    - share: amount they owe (number)\n'
+        '    - share: amount they owe (number or null if unspecified)\n'
         '- description: a concise, natural-sounding summary (max 4 words, no repetition, no generic phrases like "expense for")\n\n'
-        "For exact amount splits (e.g., 'split 323 to John and rest to me'):\n"
-        "1. Assign the specified amount to the participant\n"
-        "2. Calculate the remaining amount for unspecified shares\n"
-        "3. Ensure shares sum up to the total amount\n\n"
-        "For ratio splits (e.g., '1:1:2 split'):\n"
-        "1. Calculate total parts (e.g., 1+1+2 = 4)\n"
-        "2. Calculate share per part (total_amount/total_parts)\n"
-        "3. Multiply each person's share by their ratio\n\n"
-        "Examples:\n"
-        "1. '1253 rupees, split 323 to John and rest to me':\n"
-        "   - John's share = 323\n"
-        "   - My share = 1253 - 323 = 930\n\n"
-        "2. '100 with 1:1:2 split':\n"
-        "   - Total parts = 4\n"
-        "   - Share per part = 25\n"
-        "   - First person = 25\n"
-        "   - Second person = 25\n"
-        "   - Third person = 50\n\n"
         "⚠️ Output ONLY a valid JSON object. No markdown, no extra text.\n"
         "⚠️ Ensure all amounts are numbers, not strings."
     )
@@ -223,29 +204,14 @@ async def create_splitwise_expense(chat_id: str, expense: dict):
         raise HTTPException(status_code=401, detail="User not authorized with Splitwise")
     url = "https://secure.splitwise.com/api/v3.0/create_expense"
     headers = {"Authorization": f"Bearer {token['access_token']}"}
-    
     # Build payload
-    data = {
-        "cost": expense["cost"],
-        "description": expense["description"],
-        "currency_code": expense.get("currency_code", "INR")
-    }
-    
-    # Handle paid shares and owed shares
+    data = {"cost": expense["cost"], "description": expense["description"], "currency_code": expense.get("currency_code", "INR")}
+    data.update({"users__0__user_id": expense["paid_by"], "users__0__paid_share": expense["cost"]})
+    equal = round(expense["cost"]/len(expense["owed_by"]), 2)
     for i, uid in enumerate(expense["owed_by"]):
         data[f"users__{i}__user_id"] = uid
-        # Set paid share
-        if uid == expense["paid_by"]:
-            data[f"users__{i}__paid_share"] = "{:.2f}".format(float(expense["cost"]))
-        else:
-            data[f"users__{i}__paid_share"] = "0.00"
-        
-        # Get owed share from shares dict or calculate equal split
-        share = expense.get("shares", {}).get(str(uid))
-        if share is None:
-            share = expense["cost"] / len(expense["owed_by"])
-        data[f"users__{i}__owed_share"] = "{:.2f}".format(float(share))
-
+        share = expense.get("shares", {}).get(str(uid), equal)
+        data[f"users__{i}__owed_share"] = share
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post(url, data=data, headers=headers)
@@ -291,55 +257,37 @@ def normalize_expense(parsed, friends, self_user_id, self_name=None):
     paid_by = match_name_to_user_id(payer_name, friends, self_user_id, self_name)
     if paid_by is None:
         raise HTTPException(status_code=400, detail=f"Could not match payer name: {payer_name}")
-    
     owed_by = []
     shares = {}
-    split_type = parsed.get("split_type", "equal")
+    for part in participants:
+        name = part.get("name")
+        share = part.get("share")
+        if name is None:
+            raise HTTPException(status_code=400, detail="No participant name found in parsed expense. Please specify all participants.")
+        uid = match_name_to_user_id(name, friends, self_user_id, self_name)
+        if uid is None:
+            raise HTTPException(status_code=400, detail=f"Could not match participant name: {name}")
+        owed_by.append(uid)
+        if share is not None:
+            shares[str(uid)] = share
     cost = parsed.get("amount")
     if cost is None:
         raise HTTPException(status_code=400, detail="No amount found in parsed expense. Please specify the amount.")
-
-    # Handle ratio-based splits
-    if split_type == "ratio":
-        total_ratio = sum(part.get("ratio", 0) for part in participants)
-        if total_ratio == 0:
-            raise HTTPException(status_code=400, detail="Invalid ratio split: total ratio is 0")
-        share_per_part = cost / total_ratio
-        
-        for part in participants:
-            name = part.get("name")
-            ratio = part.get("ratio", 0)
-            if name is None:
-                raise HTTPException(status_code=400, detail="No participant name found in parsed expense. Please specify all participants.")
-            uid = match_name_to_user_id(name, friends, self_user_id, self_name)
-            if uid is None:
-                raise HTTPException(status_code=400, detail=f"Could not match participant name: {name}")
-            owed_by.append(uid)
-            shares[str(uid)] = round(share_per_part * ratio, 2)
+    # --- Fix: Ensure payer is in participants and shares sum to cost ---
+    if self_user_id not in owed_by:
+        # Add self as participant with remaining share
+        remaining = cost - sum(shares.values())
+        if remaining < 0:
+            raise HTTPException(status_code=400, detail="Participant shares exceed total cost. Please check your message.")
+        owed_by.append(self_user_id)
+        shares[str(self_user_id)] = remaining
     else:
-        # Handle regular splits (equal or exact)
-        for part in participants:
-            name = part.get("name")
-            share = part.get("share")
-            if name is None:
-                raise HTTPException(status_code=400, detail="No participant name found in parsed expense. Please specify all participants.")
-            uid = match_name_to_user_id(name, friends, self_user_id, self_name)
-            if uid is None:
-                raise HTTPException(status_code=400, detail=f"Could not match participant name: {name}")
-            owed_by.append(uid)
-            if share is not None:
-                shares[str(uid)] = share
-
-    # Ensure payer is in participants and shares sum to cost
-    if paid_by not in owed_by:
-        owed_by.append(paid_by)
-    
-    # Adjust shares to match total cost
-    total_shares = sum(shares.values())
-    if abs(total_shares - cost) > 0.01:
-        # If shares don't sum to cost, adjust the payer's share
-        shares[str(paid_by)] = shares.get(str(paid_by), 0) + (cost - total_shares)
-
+        # If self is already in, check if shares sum to cost
+        total_shares = sum(shares.values())
+        if abs(total_shares - cost) > 0.01:
+            # Adjust self's share to make total match cost
+            diff = cost - total_shares
+            shares[str(self_user_id)] = shares.get(str(self_user_id), 0) + diff
     return {
         "cost": cost,
         "description": parsed.get("description", ""),
