@@ -272,6 +272,21 @@ def normalize_expense(parsed, friends, self_user_id, self_name=None):
     cost = parsed.get("amount")
     if cost is None:
         raise HTTPException(status_code=400, detail="No amount found in parsed expense. Please specify the amount.")
+    # --- Fix: Ensure payer is in participants and shares sum to cost ---
+    if self_user_id not in owed_by:
+        # Add self as participant with remaining share
+        remaining = cost - sum(shares.values())
+        if remaining < 0:
+            raise HTTPException(status_code=400, detail="Participant shares exceed total cost. Please check your message.")
+        owed_by.append(self_user_id)
+        shares[str(self_user_id)] = remaining
+    else:
+        # If self is already in, check if shares sum to cost
+        total_shares = sum(shares.values())
+        if abs(total_shares - cost) > 0.01:
+            # Adjust self's share to make total match cost
+            diff = cost - total_shares
+            shares[str(self_user_id)] = shares.get(str(self_user_id), 0) + diff
     return {
         "cost": cost,
         "description": parsed.get("description", ""),
