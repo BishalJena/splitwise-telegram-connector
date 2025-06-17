@@ -91,6 +91,7 @@ def set_user_token(chat_id: str, access_token: str, splitwise_id: int, splitwise
         "splitwise_name": splitwise_name
     }
     save_json(tokens_file, tokens)
+    print(f"Saved token for {chat_id}: {tokens[chat_id]}")
 
 # ----------- Splitwise User Info Helper -----------
 async def get_splitwise_current_user(token: str):
