@@ -411,3 +411,54 @@ async def test_parse_api_endpoint(mock_token_storage, mock_splitwise_friends):
             assert "lunch" in parsed["description"].lower()
             assert TEST_SPLITWISE_ID in parsed["owed_by"]  # Self is included
             assert 67890 in parsed["owed_by"]  # John's ID
+
+@pytest.mark.asyncio
+async def test_create_splitwise_expense_with_shares(mock_token_storage):
+    """Test creating a Splitwise expense with specific shares"""
+    expense = {
+        "cost": 160,
+        "description": "diet coke expense",
+        "paid_by": TEST_SPLITWISE_ID,
+        "owed_by": [67890, 78901, TEST_SPLITWISE_ID],
+        "shares": {
+            "67890": 53.33,
+            "78901": 53.33,
+            str(TEST_SPLITWISE_ID): 53.34
+        },
+        "currency_code": "INR"
+    }
+    
+    with patch('httpx.AsyncClient.post') as mock_post:
+        mock_post.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"id": 12345}
+        )
+        
+        response = client.post(
+            "/api/expense",
+            json=expense,
+            params={"chat_id": TEST_CHAT_ID}
+        )
+        
+        assert response.status_code == 200
+        assert response.json()["id"] == 12345
+        
+        # Verify the request payload
+        call_args = mock_post.call_args
+        data = call_args[1]["data"]
+        assert data["cost"] == 160
+        assert data["description"] == "diet coke expense"
+        assert data["currency_code"] == "INR"
+        
+        # Check paid shares
+        assert data["users__0__user_id"] == 67890
+        assert data["users__0__paid_share"] == "0.0"
+        assert data["users__0__owed_share"] == "53.33"
+        
+        assert data["users__1__user_id"] == 78901
+        assert data["users__1__paid_share"] == "0.0"
+        assert data["users__1__owed_share"] == "53.33"
+        
+        assert data["users__2__user_id"] == TEST_SPLITWISE_ID
+        assert data["users__2__paid_share"] == "160.0"
+        assert data["users__2__owed_share"] == "53.33"
