@@ -150,10 +150,9 @@ async def callback_oauth(code: str, state: str):
 # ----------- Services -----------
 async def parse_expense_from_text(text: str, friends: list, self_name: str, self_user_id: int, telegram_name: str = None) -> dict:
     friend_list_str = ", ".join([f"{f['first_name']} (id: {f['id']})" for f in friends])
-    self_refs = [self_name]
+    self_refs = [self_name, "me", "mine", "self", "I"]
     if telegram_name and telegram_name != self_name:
         self_refs.append(telegram_name)
-    self_refs += ["me", "mine", "self"]
     self_refs_str = ", ".join(self_refs)
     system_message = (
         "You are a financial assistant that extracts structured JSON from natural-language expense messages. "
@@ -164,6 +163,7 @@ async def parse_expense_from_text(text: str, friends: list, self_name: str, self
         f'You are the user: {self_name} (id: {self_user_id}).\n'
         f'You may refer to yourself as: {self_refs_str}.\n'
         f'Your friends are: {friend_list_str}.\n'
+        f'Whenever the message refers to any of {self_refs_str}, always use "{self_name}" (id: {self_user_id}) in the output.\n'
         f'The user sent this message: "{text}".\n'
         "Your job is to convert it into structured JSON with:\n"
         '- amount: total expense amount (number)\n'
@@ -228,8 +228,15 @@ async def get_splitwise_friends(token: str):
         res.raise_for_status()
         return res.json()["friends"]
 
-def match_name_to_user_id(name, friends):
-    name = name.lower()
+def match_name_to_user_id(name, friends, self_user_id=None, self_name=None):
+    name = name.lower().strip()
+    self_names = ["me", "mine", "self", "i"]
+    if self_name:
+        self_names.append(self_name.lower())
+    if self_user_id and name in self_names:
+        return self_user_id
+    if self_name and name == self_name.lower():
+        return self_user_id
     for friend in friends:
         first = (friend.get("first_name") or "").lower()
         last = (friend.get("last_name") or "").lower()
@@ -237,15 +244,16 @@ def match_name_to_user_id(name, friends):
             return friend["id"]
     return None
 
-def normalize_expense(parsed, friends, self_user_id):
-    # Map payer and participants names to user_ids
+def normalize_expense(parsed, friends, self_user_id, self_name=None):
+    # Defensive: check for empty or missing fields
+    if not parsed or not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="Parsing failed: No data returned from model. Please rephrase your message.")
     payer_name = parsed.get("payer")
     participants = parsed.get("participants", [])
+    if payer_name is None:
+        raise HTTPException(status_code=400, detail="No payer found in parsed expense. Please specify who paid.")
     # If payer is 'me', use self_user_id
-    if isinstance(payer_name, str) and payer_name.strip().lower() in ["mine", "me", "self"]:
-        paid_by = self_user_id
-    else:
-        paid_by = match_name_to_user_id(payer_name, friends)
+    paid_by = match_name_to_user_id(payer_name, friends, self_user_id, self_name)
     if paid_by is None:
         raise HTTPException(status_code=400, detail=f"Could not match payer name: {payer_name}")
     owed_by = []
@@ -253,10 +261,9 @@ def normalize_expense(parsed, friends, self_user_id):
     for part in participants:
         name = part.get("name")
         share = part.get("share")
-        if isinstance(name, str) and name.strip().lower() in ["mine", "me", "self"]:
-            uid = self_user_id
-        else:
-            uid = match_name_to_user_id(name, friends)
+        if name is None:
+            raise HTTPException(status_code=400, detail="No participant name found in parsed expense. Please specify all participants.")
+        uid = match_name_to_user_id(name, friends, self_user_id, self_name)
         if uid is None:
             raise HTTPException(status_code=400, detail=f"Could not match participant name: {name}")
         owed_by.append(uid)
@@ -264,7 +271,7 @@ def normalize_expense(parsed, friends, self_user_id):
             shares[str(uid)] = share
     cost = parsed.get("amount")
     if cost is None:
-        raise HTTPException(status_code=400, detail="No amount found in parsed expense")
+        raise HTTPException(status_code=400, detail="No amount found in parsed expense. Please specify the amount.")
     return {
         "cost": cost,
         "description": parsed.get("description", ""),
@@ -288,7 +295,6 @@ async def send_telegram_message(chat_id: str, text: str):
 # ----------- Telegram Webhook -----------
 @router.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
-    global pending_expenses
     logging.debug("Received webhook call")
     try:
         payload = await req.json()
@@ -322,36 +328,11 @@ async def telegram_webhook(req: Request):
         return {"ok": True}
 
     try:
-        # Check if this is a clarification response
-        if chat_id in pending_expenses:
-            # This is a response to a clarification question
-            pending = pending_expenses[chat_id]
-            if text.lower() in ["i did", "me", "mine", "self"]:
-                # User confirmed they paid
-                pending["parsed"]["payer"] = "me"
-                normalized = normalize_expense(pending["parsed"], pending["friends"], token["splitwise_id"])
-                del pending_expenses[chat_id]  # Clear pending expense
-                res = await create_splitwise_expense(chat_id, normalized)
-                await send_telegram_message(chat_id, f"✅ Expense added: {normalized['description']} - ₹{normalized['cost']}")
-                return {"ok": True}
-            else:
-                # User provided a different response, treat as new expense
-                del pending_expenses[chat_id]
-
         friends = await get_splitwise_friends(token["access_token"])
         parsed = await parse_expense_from_text(text, friends, token["splitwise_name"], token["splitwise_id"])
         logging.debug(f"Parsed expense: {parsed}")
-        normalized = normalize_expense(parsed, friends, token["splitwise_id"])
+        normalized = normalize_expense(parsed, friends, token["splitwise_id"], token["splitwise_name"])
         logging.debug(f"Normalized expense: {normalized}")
-        clarification = await validate_expense_clarity(text, parsed)
-        if clarification:
-            # Store the pending expense context
-            pending_expenses[chat_id] = {
-                "parsed": parsed,
-                "friends": friends
-            }
-            await send_telegram_message(chat_id, f"❓ {clarification}")
-            return {"ok": True}
         res = await create_splitwise_expense(chat_id, normalized)
         logging.debug(f"Splitwise response: {res}")
         await send_telegram_message(chat_id, f"✅ Expense added: {normalized['description']} - ₹{normalized['cost']}")
