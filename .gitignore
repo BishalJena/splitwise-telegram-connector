@@ -6,3 +6,5 @@ pending_oauth.json
 .DS_Store
 .idea/
 .vscode/
+.pytest_cache/
+

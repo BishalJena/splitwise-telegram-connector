@@ -389,7 +389,8 @@ async def telegram_webhook(req: Request):
 # ----------- Additional API Endpoints -----------
 @router.post("/api/expense")
 async def api_create_expense(expense: ExpenseInput, chat_id: str):
-    return await create_splitwise_expense(chat_id, expense.dict())
+    """Create a Splitwise expense via API"""
+    return await create_splitwise_expense(chat_id, expense.model_dump())
 
 @router.post("/api/parse")
 async def api_parse_expense(payload: ParseInput, chat_id: str):
