@@ -9,6 +9,7 @@ import json
 from urllib.parse import urlencode
 import traceback
 import re
+import asyncio
 
 # Load environment variables
 load_dotenv()
@@ -342,6 +343,32 @@ async def telegram_webhook(req: Request):
         await send_telegram_message(chat_id, "❌ User not authorized with Splitwise. Send /start to authorize.")
         return {"ok": True}
 
+    # --- Hybrid Command Parsing ---
+    parsed = parse_command_regex(text)
+    if parsed:
+        vetted = await vet_command_with_llm(text, parsed)
+        if vetted.get("command") and vetted["command"] != "unknown":
+            cmd = vetted["command"]
+            if cmd == "show_recent_expenses":
+                await handle_show_recent_expenses(chat_id, token)
+            elif cmd == "show_expenses_by_category":
+                await handle_show_expenses_by_category(chat_id, token, vetted.get("category"))
+            elif cmd == "show_expenses_with_friend":
+                await handle_show_expenses_with_friend(chat_id, token, vetted.get("friend"))
+            elif cmd == "show_balance_with_friend":
+                await handle_show_balance_with_friend(chat_id, token, vetted.get("friend"))
+            elif cmd == "show_balances":
+                await handle_show_balances(chat_id, token)
+            elif cmd == "delete_expense":
+                await handle_delete_expense(chat_id, token, vetted.get("expense_id"))
+            elif cmd == "help":
+                await handle_help(chat_id)
+            else:
+                await send_telegram_message(chat_id, "❌ Command recognized but not implemented.")
+            return {"ok": True}
+        elif vetted.get("command") == "unknown":
+            await send_telegram_message(chat_id, "❌ Sorry, I couldn't understand your command. Please try again or use /help.")
+            return {"ok": True}
     try:
         friends = await get_splitwise_friends(token["access_token"])
         parsed = await parse_expense_from_text(text, friends, token["splitwise_name"], token["splitwise_id"])
@@ -409,6 +436,277 @@ async def validate_expense_clarity(text: str, parsed: dict) -> str | None:
     except Exception as e:
         logging.error(f"Clarity validation error: {e}")
         return None
+
+def parse_command_regex(text):
+    text = text.strip().lower()
+    # 1. Show recent expenses
+    if re.match(r"show (me )?recent expenses", text):
+        return {"command": "show_recent_expenses"}
+    # 2. Show expenses by category
+    m = re.match(r"show (me )?(?P<category>\w+) expenses", text)
+    if m:
+        return {"command": "show_expenses_by_category", "category": m.group("category")}
+    # 3. Show expenses with a friend
+    m = re.match(r"show (me )?expenses with (?P<friend>[\w ]+)", text)
+    if m:
+        return {"command": "show_expenses_with_friend", "friend": m.group("friend").strip()}
+    # 4. Show balance with a friend
+    m = re.match(r"how much do i owe (?P<friend>[\w ]+)", text)
+    if m:
+        return {"command": "show_balance_with_friend", "friend": m.group("friend").strip()}
+    # 5. Show total owed/owing
+    if re.match(r"show (me )?my balances", text):
+        return {"command": "show_balances"}
+    # 6. Delete an expense
+    m = re.match(r"delete expense #(\d+)", text)
+    if m:
+        return {"command": "delete_expense", "expense_id": int(m.group(1))}
+    if re.match(r"delete last expense", text):
+        return {"command": "delete_expense", "expense_id": None}
+    # 8. Help
+    if text.startswith("/help") or text == "help":
+        return {"command": "help"}
+    return None
+
+async def vet_command_with_llm(text, parsed_command):
+    prompt = (
+        f'The user sent: "{text}".\n'
+        f'My regex parser thinks this means: {json.dumps(parsed_command)}.\n'
+        'Is this correct? If yes, reply ONLY with the JSON object. '
+        'If not, reply with the correct command and arguments as a JSON object, '
+        'or reply with {"command": "unknown"} if you can\'t tell.'
+    )
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    response = await asyncio.to_thread(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}]
+        )
+    )
+    content = response.choices[0].message.content.strip()
+    try:
+        return json.loads(content)
+    except Exception:
+        return {"command": "unknown"}
+
+# --- Command Handlers (stubs) ---
+async def handle_show_recent_expenses(chat_id, token):
+    url = "https://secure.splitwise.com/api/v3.0/get_expenses"
+    headers = {"Authorization": f"Bearer {token['access_token']}"}
+    params = {"limit": 5}
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(url, headers=headers, params=params)
+            res.raise_for_status()
+            data = res.json()
+            expenses = data.get("expenses", [])
+            if not expenses:
+                await send_telegram_message(chat_id, "No recent expenses found.")
+                return
+            msg_lines = []
+            for e in expenses:
+                desc = e.get("description", "(No description)")
+                cost = float(e.get("cost", "0"))
+                currency = e.get("currency_code", "")
+                date = e.get("date", "")[:10]
+                msg_lines.append(f"{desc} | {cost:.2f} {currency} | {date}")
+            msg = "Recent expenses:\n" + "\n".join(msg_lines)
+            await send_telegram_message(chat_id, msg)
+    except Exception as e:
+        await send_telegram_message(chat_id, f"❌ Failed to fetch recent expenses: {e}")
+
+async def handle_show_expenses_by_category(chat_id, token, category):
+    cat_url = "https://secure.splitwise.com/api/v3.0/get_categories"
+    headers = {"Authorization": f"Bearer {token['access_token']}"}
+    try:
+        async with httpx.AsyncClient() as client:
+            cat_res = await client.get(cat_url, headers=headers)
+            cat_res.raise_for_status()
+            categories = cat_res.json().get("categories", [])
+            subcats = []
+            for parent in categories:
+                for sub in parent.get("subcategories", []):
+                    subcats.append(sub)
+            cat_name = category.lower()
+            matches = [sub for sub in subcats if cat_name in sub.get("name", "").lower()]
+            if not matches:
+                await send_telegram_message(chat_id, f"❌ Category '{category}' not found.")
+                return
+            if len(matches) > 1:
+                names = ', '.join([sub['name'] for sub in matches])
+                await send_telegram_message(chat_id, f"Multiple categories match '{category}': {names}. Please be more specific.")
+                return
+            cat_id = matches[0]["id"]
+            cat_label = matches[0]["name"]
+            exp_url = "https://secure.splitwise.com/api/v3.0/get_expenses"
+            params = {"category_id": cat_id, "limit": 5}
+            exp_res = await client.get(exp_url, headers=headers, params=params)
+            exp_res.raise_for_status()
+            expenses = exp_res.json().get("expenses", [])
+            if not expenses:
+                await send_telegram_message(chat_id, f"No recent expenses found for category '{cat_label}'.")
+                return
+            msg_lines = []
+            for e in expenses:
+                desc = e.get("description", "(No description)")
+                cost = float(e.get("cost", "0"))
+                currency = e.get("currency_code", "")
+                date = e.get("date", "")[:10]
+                msg_lines.append(f"{desc} | {cost:.2f} {currency} | {date}")
+            msg = f"Recent expenses for '{cat_label}':\n" + "\n".join(msg_lines)
+            await send_telegram_message(chat_id, msg)
+    except Exception as e:
+        await send_telegram_message(chat_id, f"❌ Failed to fetch expenses for category '{category}': {e}")
+
+async def handle_show_expenses_with_friend(chat_id, token, friend):
+    friends_url = "https://secure.splitwise.com/api/v3.0/get_friends"
+    headers = {"Authorization": f"Bearer {token['access_token']}"}
+    try:
+        async with httpx.AsyncClient() as client:
+            friends_res = await client.get(friends_url, headers=headers)
+            friends_res.raise_for_status()
+            friends = friends_res.json().get("friends", [])
+            friend_name = friend.lower()
+            matches = [f for f in friends if friend_name in (f.get("first_name") or "").lower() or friend_name in (f.get("last_name") or "").lower()]
+            if not matches:
+                await send_telegram_message(chat_id, f"❌ Friend '{friend}' not found.")
+                return
+            if len(matches) > 1:
+                names = ', '.join([f.get('first_name', '') for f in matches])
+                await send_telegram_message(chat_id, f"Multiple friends match '{friend}': {names}. Please be more specific.")
+                return
+            friend_id = matches[0]["id"]
+            friend_label = matches[0].get("first_name", "")
+            exp_url = "https://secure.splitwise.com/api/v3.0/get_expenses"
+            params = {"friend_id": friend_id, "limit": 5}
+            exp_res = await client.get(exp_url, headers=headers, params=params)
+            exp_res.raise_for_status()
+            expenses = exp_res.json().get("expenses", [])
+            if not expenses:
+                await send_telegram_message(chat_id, f"No recent expenses found with '{friend_label}'.")
+                return
+            msg_lines = []
+            for e in expenses:
+                desc = e.get("description", "(No description)")
+                cost = float(e.get("cost", "0"))
+                currency = e.get("currency_code", "")
+                date = e.get("date", "")[:10]
+                msg_lines.append(f"{desc} | {cost:.2f} {currency} | {date}")
+            msg = f"Recent expenses with '{friend_label}':\n" + "\n".join(msg_lines)
+            await send_telegram_message(chat_id, msg)
+    except Exception as e:
+        await send_telegram_message(chat_id, f"❌ Failed to fetch expenses with '{friend}': {e}")
+
+async def handle_show_balance_with_friend(chat_id, token, friend):
+    friends_url = "https://secure.splitwise.com/api/v3.0/get_friends"
+    headers = {"Authorization": f"Bearer {token['access_token']}"}
+    try:
+        async with httpx.AsyncClient() as client:
+            friends_res = await client.get(friends_url, headers=headers)
+            friends_res.raise_for_status()
+            friends = friends_res.json().get("friends", [])
+            friend_name = friend.lower()
+            matches = [f for f in friends if friend_name in (f.get("first_name") or "").lower() or friend_name in (f.get("last_name") or "").lower()]
+            if not matches:
+                await send_telegram_message(chat_id, f"❌ Friend '{friend}' not found.")
+                return
+            if len(matches) > 1:
+                names = ', '.join([f.get('first_name', '') for f in matches])
+                await send_telegram_message(chat_id, f"Multiple friends match '{friend}': {names}. Please be more specific.")
+                return
+            friend_obj = matches[0]
+            balances = friend_obj.get("balance", [])
+            if not balances:
+                await send_telegram_message(chat_id, f"No balance found with '{friend_obj.get('first_name','')}'.")
+                return
+            msg_lines = []
+            for b in balances:
+                amount = float(b.get("amount", "0"))
+                currency = b.get("currency_code", "")
+                if amount > 0:
+                    msg_lines.append(f"You are owed {amount:.2f} {currency} by {friend_obj.get('first_name','')}.")
+                elif amount < 0:
+                    msg_lines.append(f"You owe {abs(amount):.2f} {currency} to {friend_obj.get('first_name','')}.")
+                else:
+                    msg_lines.append(f"You and {friend_obj.get('first_name','')} are settled up in {currency}.")
+            msg = "\n".join(msg_lines)
+            await send_telegram_message(chat_id, msg)
+    except Exception as e:
+        await send_telegram_message(chat_id, f"❌ Failed to fetch balance with '{friend}': {e}")
+
+async def handle_show_balances(chat_id, token):
+    friends_url = "https://secure.splitwise.com/api/v3.0/get_friends"
+    headers = {"Authorization": f"Bearer {token['access_token']}"}
+    try:
+        async with httpx.AsyncClient() as client:
+            friends_res = await client.get(friends_url, headers=headers)
+            friends_res.raise_for_status()
+            friends = friends_res.json().get("friends", [])
+            totals_owed = {}
+            totals_owes = {}
+            for f in friends:
+                for b in f.get("balance", []):
+                    amount = float(b.get("amount", "0"))
+                    currency = b.get("currency_code", "")
+                    if amount > 0:
+                        totals_owed[currency] = totals_owed.get(currency, 0) + amount
+                    elif amount < 0:
+                        totals_owes[currency] = totals_owes.get(currency, 0) + abs(amount)
+            msg_lines = []
+            if totals_owed:
+                for currency, amt in totals_owed.items():
+                    msg_lines.append(f"You are owed {amt:.2f} {currency}")
+            if totals_owes:
+                for currency, amt in totals_owes.items():
+                    msg_lines.append(f"You owe {amt:.2f} {currency}")
+            if not msg_lines:
+                msg_lines.append("You are all settled up with everyone!")
+            msg = "Your balances summary:\n" + "\n".join(msg_lines)
+            await send_telegram_message(chat_id, msg)
+    except Exception as e:
+        await send_telegram_message(chat_id, f"❌ Failed to fetch balances summary: {e}")
+
+async def handle_delete_expense(chat_id, token, expense_id):
+    headers = {"Authorization": f"Bearer {token['access_token']}"}
+    try:
+        async with httpx.AsyncClient() as client:
+            if expense_id is None:
+                exp_url = "https://secure.splitwise.com/api/v3.0/get_expenses"
+                exp_res = await client.get(exp_url, headers=headers, params={"limit": 1})
+                exp_res.raise_for_status()
+                expenses = exp_res.json().get("expenses", [])
+                if not expenses:
+                    await send_telegram_message(chat_id, "No expenses found to delete.")
+                    return
+                expense_id = expenses[0].get("id")
+                if not expense_id:
+                    await send_telegram_message(chat_id, "Could not determine expense ID to delete.")
+                    return
+            del_url = f"https://secure.splitwise.com/api/v3.0/delete_expense/{expense_id}"
+            del_res = await client.post(del_url, headers=headers)
+            del_res.raise_for_status()
+            result = del_res.json()
+            if result.get("success"):
+                await send_telegram_message(chat_id, f"✅ Expense #{expense_id} deleted.")
+            else:
+                await send_telegram_message(chat_id, f"❌ Failed to delete expense #{expense_id}.")
+    except Exception as e:
+        await send_telegram_message(chat_id, f"❌ Error deleting expense: {e}")
+
+async def handle_help(chat_id):
+    help_text = (
+        "Available commands:\n"
+        "- show me recent expenses\n"
+        "- show me <category> expenses\n"
+        "- show expenses with <friend>\n"
+        "- how much do I owe <friend>\n"
+        "- show my balances\n"
+        "- delete expense #<id>\n"
+        "- delete last expense\n"
+        "- /help\n"
+        "Or just send an expense description to add it!"
+    )
+    await send_telegram_message(chat_id, help_text)
 
 if __name__ == "__main__":
     import uvicorn
