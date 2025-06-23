@@ -359,20 +359,84 @@ async def test_invalid_expense_format(mock_token_storage, mock_splitwise_friends
 
 @pytest.mark.asyncio
 async def test_expense_with_unknown_friend(mock_token_storage, mock_splitwise_friends):
-    """Test expense with unknown friend"""
-    with patch('app.main.get_splitwise_friends', return_value=mock_splitwise_friends["friends"]):
-        with patch('app.main.send_telegram_message') as mock_send:
+    """Test expense with unknown friend triggers correction/creation prompt and handles all reply types."""
+    friends_initial = mock_splitwise_friends["friends"]
+    new_friend = {"id": "new:Charlie", "first_name": "Charlie", "last_name": "", "balance": [{"amount": "0", "currency_code": "INR"}]}
+    friends_with_new = friends_initial + [new_friend]
+    with patch('app.main.get_splitwise_friends', side_effect=[friends_initial, friends_initial, friends_with_new, friends_initial]):
+        with patch('app.main.send_telegram_message') as mock_send, \
+             patch('app.main.create_splitwise_expense') as mock_create:
+            # Step 1: Send expense with misspelled friend
             webhook_data = {
                 "message": {
                     "chat": {"id": TEST_CHAT_ID},
-                    "text": "paid 500 for lunch with Bob"  # Unknown friend
+                    "text": "paid 500 for lunch with Bobb"  # Misspelled friend
                 }
             }
             response = client.post("/telegram/webhook", json=webhook_data)
             assert response.status_code == 200
-            mock_send.assert_called_once()
-            call_args = mock_send.call_args[0]
-            assert "could not match" in call_args[1].lower()
+            mock_send.assert_called()
+            prompt_call = mock_send.call_args_list[-1][0][1].lower()
+            assert "please reply with the correct friend's name" in prompt_call
+
+            # Step 2: Simulate user replying with correct name (existing friend)
+            mock_send.reset_mock()
+            mock_create.reset_mock()
+            webhook_data_correct = {
+                "message": {
+                    "chat": {"id": TEST_CHAT_ID},
+                    "text": "John"
+                }
+            }
+            response_correct = client.post("/telegram/webhook", json=webhook_data_correct)
+            assert response_correct.status_code == 200
+            mock_create.assert_called_once()
+            success_call = mock_send.call_args_list[-1][0][1].lower()
+            assert "expense added with corrected friend 'john'" in success_call
+
+            # Step 3: Simulate user replying with a new name (new friend)
+            mock_send.reset_mock()
+            mock_create.reset_mock()
+            # Re-trigger pending_new_friend for this test
+            webhook_data = {
+                "message": {
+                    "chat": {"id": TEST_CHAT_ID},
+                    "text": "paid 500 for lunch with Bobb"  # Misspelled friend
+                }
+            }
+            client.post("/telegram/webhook", json=webhook_data)
+            webhook_data_new = {
+                "message": {
+                    "chat": {"id": TEST_CHAT_ID},
+                    "text": "Charlie"
+                }
+            }
+            response_new = client.post("/telegram/webhook", json=webhook_data_new)
+            assert response_new.status_code == 200
+            mock_create.assert_called_once()
+            new_friend_call = mock_send.call_args_list[-1][0][1].lower()
+            assert "new friend 'charlie' created and expense added" in new_friend_call
+
+            # Step 4: Simulate user replying 'no' (cancel)
+            mock_send.reset_mock()
+            # Re-trigger pending_new_friend for this test
+            webhook_data = {
+                "message": {
+                    "chat": {"id": TEST_CHAT_ID},
+                    "text": "paid 500 for lunch with Bobb"  # Misspelled friend
+                }
+            }
+            client.post("/telegram/webhook", json=webhook_data)
+            webhook_data_no = {
+                "message": {
+                    "chat": {"id": TEST_CHAT_ID},
+                    "text": "no"
+                }
+            }
+            response_no = client.post("/telegram/webhook", json=webhook_data_no)
+            assert response_no.status_code == 200
+            cancel_call = mock_send.call_args_list[-1][0][1].lower()
+            assert "expense cancelled" in cancel_call
 
 @pytest.mark.asyncio
 async def test_expense_api_endpoint(mock_token_storage):
@@ -411,3 +475,41 @@ async def test_parse_api_endpoint(mock_token_storage, mock_splitwise_friends):
             assert "lunch" in parsed["description"].lower()
             assert TEST_SPLITWISE_ID in parsed["owed_by"]  # Self is included
             assert 67890 in parsed["owed_by"]  # John's ID
+
+@pytest.mark.asyncio
+async def test_complex_expense_parsing(mock_token_storage):
+    """Test parsing a complex, real-world expense note with items, discounts, exclusions, and final total."""
+    complex_text = (
+        "I paid 674 for dinner. Manan and Siddham were there.  "
+        "Cold drinks were 95 total, 40 each to manan and siddham, 15 mine — no discount on those.  "
+        "I had chicken biryani for 120. They had 150 combo meals each.  "
+        "Also had veg manchurian (120) and mushroom (99), we shared those three-way.  "
+        "10% student discount on food only, not drinks.  "
+        "Total after all is 674."
+    )
+    # Mock friends list to include Manan and Siddham
+    friends = [
+        {"id": 111, "first_name": "Manan", "last_name": "", "balance": [{"amount": "0", "currency_code": "INR"}]},
+        {"id": 222, "first_name": "Siddham", "last_name": "", "balance": [{"amount": "0", "currency_code": "INR"}]}
+    ]
+    with patch('app.main.get_splitwise_friends', return_value=friends):
+        with patch('app.main.create_splitwise_expense') as mock_create:
+            webhook_data = {
+                "message": {
+                    "chat": {"id": TEST_CHAT_ID},
+                    "text": complex_text
+                }
+            }
+            response = client.post("/telegram/webhook", json=webhook_data)
+            assert response.status_code == 200
+            mock_create.assert_called_once()
+            call_args = mock_create.call_args[0]
+            expense_data = call_args[1]
+            # Check that the total cost matches
+            assert expense_data["cost"] == 674
+            # Check that all participants are present
+            assert set(expense_data["owed_by"]) == {TEST_SPLITWISE_ID, 111, 222}
+            # Check that the shares sum to the total
+            assert abs(sum(expense_data["shares"].values()) - 674) < 0.01
+            # Check that the description is short
+            assert len(expense_data["description"].split()) <= 4
