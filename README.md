@@ -2,6 +2,10 @@
 
 A FastAPI-based backend to connect Telegram with Splitwise, allowing users to add expenses via a Telegram bot.
 
+https://github.com/user-attachments/assets/60e81d3b-027b-40fd-965d-2d31ab384e75
+
+[Youtube Demo: https://youtu.be/FY1rhC9Ax3g?si=y6nG-xkbs_epzSEJ]
+
 ## Features
 - Multi-user Splitwise OAuth
 - Add expenses via Telegram
