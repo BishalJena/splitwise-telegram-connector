@@ -463,21 +463,28 @@ async def telegram_webhook(req: Request):
             cmd = command_data["command"]
             if cmd == "show_recent_expenses":
                 await handle_show_recent_expenses(chat_id, token)
+                return {"ok": True}
             elif cmd == "show_expenses_by_category":
                 await handle_show_expenses_by_category(chat_id, token, command_data.get("category"))
+                return {"ok": True}
             elif cmd == "show_expenses_with_friend":
                 await handle_show_expenses_with_friend(chat_id, token, command_data.get("friend"))
+                return {"ok": True}
             elif cmd == "show_balance_with_friend":
                 await handle_show_balance_with_friend(chat_id, token, command_data.get("friend"))
+                return {"ok": True}
             elif cmd == "show_balances":
                 await handle_show_balances(chat_id, token)
+                return {"ok": True}
             elif cmd == "delete_expense":
                 await handle_delete_expense(chat_id, token, command_data.get("expense_id"))
+                return {"ok": True}
             elif cmd == "help":
                 await handle_help(chat_id)
+                return {"ok": True}
             else:
                 await send_telegram_message(chat_id, "❌ Command recognized but not implemented.")
-            return {"ok": True}
+                return {"ok": True}
         except Exception as e:
             logging.exception("Command handling error")
             await send_telegram_message(chat_id, f"❌ Error executing command: {str(e)}")
@@ -495,8 +502,44 @@ async def telegram_webhook(req: Request):
         if 'errors' in res and res['errors']:
             await send_telegram_message(chat_id, f"❌ Failed to add expense: {res['errors']}")
         else:
-            await send_telegram_message(chat_id, f"✅ Expense added: {normalized['description']} - {format_amount(normalized['cost'], normalized['currency_code'])}")
-            # Store expense in supermemory (non-sensitive data only)
+            # --- Use authoritative split from Splitwise response ---
+            expense_obj = None
+            user_splits = []
+            # Splitwise API may return 'expenses' (list) or just a single expense
+            if isinstance(res, dict) and 'expenses' in res and res['expenses']:
+                expense_obj = res['expenses'][0]
+                user_splits = expense_obj.get('users', [])
+            elif isinstance(res, dict) and 'users' in res:
+                expense_obj = res
+                user_splits = res.get('users', [])
+            else:
+                # fallback: use normalized
+                expense_obj = normalized
+                user_splits = []
+
+            # Build a mapping from user_id to name (self + friends)
+            user_id_to_name = {str(f["id"]): f.get("first_name", "") for f in friends}
+            user_id_to_name[str(token["splitwise_id"])] = token["splitwise_name"]
+
+            split_lines = []
+            split_meta = []
+            for u in user_splits:
+                uid = str(u.get("user_id") or (u.get("user", {}) or {}).get("id"))
+                name = user_id_to_name.get(uid, f"User {uid}")
+                owed = u.get("owed_share")
+                paid = u.get("paid_share")
+                split_lines.append(f"{name}: {format_amount(owed, (expense_obj.get('currency_code') or normalized.get('currency_code', 'INR')))}")
+                split_meta.append({
+                    "user_id": uid,
+                    "name": name,
+                    "owed_share": owed,
+                    "paid_share": paid
+                })
+            split_details = "\n".join(split_lines)
+            msg = f"✅ Expense added: {expense_obj.get('description', normalized.get('description'))} - {format_amount(expense_obj.get('cost', normalized.get('cost')), expense_obj.get('currency_code', normalized.get('currency_code', 'INR')))}"
+            if split_details:
+                msg += f"\n{split_details}"
+            await send_telegram_message(chat_id, msg)
             try:
                 supermemory_client.memories.add(
                     content=text,  # The original user message
@@ -504,25 +547,55 @@ async def telegram_webhook(req: Request):
                     metadata={
                         "type": "expense",
                         "content_type": "expense",
-                        "description": normalized.get("description"),
-                        "amount": normalized.get("cost"),
-                        "currency": normalized.get("currency_code"),
-                        "participants": ", ".join([p["name"] for p in normalized.get("participants", [])]),
+                        "description": expense_obj.get("description", normalized.get("description")),
+                        "amount": expense_obj.get("cost", normalized.get("cost")),
+                        "currency": expense_obj.get("currency_code", normalized.get("currency_code", "INR")),
+                        "split": json.dumps(split_meta),
                         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
                     }
                 )
             except Exception as e:
                 logging.warning(f"supermemory expense store failed: {e}")
+            return {"ok": True}
     except HTTPException as he:
         if he.status_code == 409 and str(he.detail).startswith("PENDING_NEW_FRIEND::"):
             friend_name = str(he.detail).split("::", 1)[1]
-            await send_telegram_message(chat_id, f"I couldn't find anyone named '{friend_name}' in your Splitwise friends. Please reply with the correct friend's name, a new name to create, or 'no' to cancel.")
+            await send_telegram_message(chat_id, f"❌ Could not find anyone named '{friend_name}' in your Splitwise friends. Please reply with the correct friend, a new name to create, or 'no' to cancel.")
+            return {"ok": True}
         else:
             logging.warning(f"HTTP error: {he.detail}")
+            # --- Store as chat message in supermemory if not a command or expense ---
+            try:
+                supermemory_client.memories.add(
+                    content=text,
+                    container_tags=[str(chat_id)],
+                    metadata={
+                        "type": "chat_message",
+                        "content_type": "chat_message",
+                        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    }
+                )
+            except Exception as se:
+                logging.warning(f"supermemory chat_message store failed: {se}")
             await send_telegram_message(chat_id, f"❌ {he.detail}")
+            # Do not return here; proceed to semantic search
     except Exception as e:
         logging.exception("Expense handling error")
+        # --- Store as chat message in supermemory if not a command or expense ---
+        try:
+            supermemory_client.memories.add(
+                content=text,
+                container_tags=[str(chat_id)],
+                metadata={
+                    "type": "chat_message",
+                    "content_type": "chat_message",
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                }
+            )
+        except Exception as se:
+            logging.warning(f"supermemory chat_message store failed: {se}")
         await send_telegram_message(chat_id, "❌ Error processing expense. Please check your message format.")
+        # Do not return here; proceed to semantic search
 
     # If not a command or expense, treat as a search query
     try:

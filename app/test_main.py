@@ -349,28 +349,45 @@ def valid_token():
 
 def test_chat_message_stored_in_supermemory():
     with patch('app.main.get_user_token', return_value=valid_token()):
-        with patch('app.main.supermemory_client.memories.add') as mock_add:
-            webhook_data = {
-                "message": {
-                    "chat": {"id": "12345"},
-                    "text": "hello, this is a test"
+        with patch('app.main.get_splitwise_friends', return_value=[]):
+            with patch('app.main.supermemory_client.memories.add') as mock_add:
+                webhook_data = {
+                    "message": {
+                        "chat": {"id": "12345"},
+                        "text": "hello, this is a test"
+                    }
                 }
-            }
-            response = client.post("/telegram/webhook", json=webhook_data)
-            assert response.status_code == 200
-            assert mock_add.called
-            call_args = mock_add.call_args[1]
-            assert call_args['content'] == "hello, this is a test"
-            assert call_args['container_tags'] == ["12345"]
-            assert call_args['metadata']['type'] == "chat_message"
-            assert call_args['metadata']['content_type'] == "chat_message"
-            assert "timestamp" in call_args['metadata']
+                response = client.post("/telegram/webhook", json=webhook_data)
+                assert response.status_code == 200
+                assert mock_add.called
+                call_args = mock_add.call_args[1]
+                assert call_args['content'] == "hello, this is a test"
+                assert call_args['container_tags'] == ["12345"]
+                assert call_args['metadata']['type'] == "chat_message"
+                assert call_args['metadata']['content_type'] == "chat_message"
+                assert "timestamp" in call_args['metadata']
 
 def test_expense_stored_in_supermemory(mock_splitwise_friends):
     with patch('app.main.get_user_token', return_value=valid_token()):
         with patch('app.main.get_splitwise_friends', return_value=mock_splitwise_friends["friends"]):
-            with patch('app.main.create_splitwise_expense') as mock_create_exp, \
-                 patch('app.main.supermemory_client.memories.add') as mock_add_mem:
+            # Mock Splitwise API response with authoritative split
+            authoritative_expense = {
+                "expenses": [
+                    {
+                        "cost": "500.00",
+                        "description": "Lunch",
+                        "currency_code": "INR",
+                        "users": [
+                            {"user_id": 12345, "paid_share": "500.00", "owed_share": "250.00", "user": {"id": 12345, "first_name": "TestUser"}},
+                            {"user_id": 67890, "paid_share": "0.00", "owed_share": "150.00", "user": {"id": 67890, "first_name": "John"}},
+                            {"user_id": 67891, "paid_share": "0.00", "owed_share": "100.00", "user": {"id": 67891, "first_name": "Alice"}},
+                        ]
+                    }
+                ]
+            }
+            with patch('app.main.create_splitwise_expense', return_value=authoritative_expense) as mock_create_exp, \
+                 patch('app.main.supermemory_client.memories.add') as mock_add_mem, \
+                 patch('app.main.send_telegram_message') as mock_send:
                 webhook_data = {
                     "message": {
                         "chat": {"id": "12345"},
@@ -387,30 +404,54 @@ def test_expense_stored_in_supermemory(mock_splitwise_friends):
                 assert kwargs['metadata']['type'] == "expense"
                 assert kwargs['metadata']['description']
                 assert kwargs['metadata']['amount']
+                # Check authoritative split (now a JSON string)
+                split_json = kwargs['metadata'].get('split')
+                assert split_json is not None and isinstance(split_json, str)
+                split = json.loads(split_json)
+                # Check that all users are present and shares match
+                expected = {
+                    12345: ("TestUser", "250.00", "500.00"),
+                    67890: ("John", "150.00", "0.00"),
+                    67891: ("Alice", "100.00", "0.00"),
+                }
+                for entry in split:
+                    uid = int(entry['user_id'])
+                    assert uid in expected
+                    name, owed, paid = expected[uid]
+                    assert entry['name'] == name
+                    assert entry['owed_share'] == owed
+                    assert entry['paid_share'] == paid
+                # Check confirmation message includes authoritative split
+                assert mock_send.called
+                sent_msg = "".join([str(call[0][1]) for call in mock_send.call_args_list])
+                for name, owed, _ in expected.values():
+                    assert name in sent_msg
+                    assert owed in sent_msg
 
 def test_search_query_returns_results():
     with patch('app.main.get_user_token', return_value=valid_token()):
-        with patch('app.main.supermemory_client.search.execute') as mock_search, \
-             patch('app.main.send_telegram_message') as mock_send:
-            mock_search.return_value.results = [
-                type('Result', (), {
-                    'chunks': [type('Chunk', (), {'content': 'pizza expense'})],
-                    'metadata': {'content_type': 'expense', 'description': 'pizza', 'amount': 10, 'currency': 'USD'},
-                    'score': 0.95,
-                    'document_id': 'doc1'
-                })()
-            ]
-            webhook_data = {
-                "message": {
-                    "chat": {"id": "12345"},
-                    "text": "pizza"
+        with patch('app.main.get_splitwise_friends', return_value=[]):
+            with patch('app.main.supermemory_client.search.execute') as mock_search, \
+                 patch('app.main.send_telegram_message') as mock_send:
+                mock_search.return_value.results = [
+                    type('Result', (), {
+                        'chunks': [type('Chunk', (), {'content': 'pizza expense'})],
+                        'metadata': {'content_type': 'expense', 'description': 'pizza', 'amount': 10, 'currency': 'USD'},
+                        'score': 0.95,
+                        'document_id': 'doc1'
+                    })()
+                ]
+                webhook_data = {
+                    "message": {
+                        "chat": {"id": "12345"},
+                        "text": "pizza"
+                    }
                 }
-            }
-            response = client.post("/telegram/webhook", json=webhook_data)
-            assert response.status_code == 200
-            mock_send.assert_called()
-            found = any("pizza" in call[0][1] for call in mock_send.call_args_list)
-            assert found
+                response = client.post("/telegram/webhook", json=webhook_data)
+                assert response.status_code == 200
+                mock_send.assert_called()
+                found = any("pizza" in call[0][1] for call in mock_send.call_args_list)
+                assert found
 
 def test_invalid_expense_format(mock_token_storage, mock_splitwise_friends):
     with patch('app.main.get_splitwise_friends', return_value=mock_splitwise_friends["friends"]):
@@ -431,21 +472,50 @@ def test_expense_with_unknown_friend(mock_token_storage, mock_splitwise_friends)
     friends_initial = mock_splitwise_friends["friends"]
     new_friend = {"id": "new:Charlie", "first_name": "Charlie", "last_name": "", "balance": [{"amount": "0", "currency_code": "INR"}]}
     friends_with_new = friends_initial + [new_friend]
+    parsed_expense = {
+        "amount": 500,
+        "description": "lunch",
+        "payer": "me",
+        "participants": [
+            {"name": "John", "share": 250},
+            {"name": "Bobb", "share": 250}
+        ]
+    }
     with patch('app.main.get_splitwise_friends', side_effect=[friends_initial, friends_initial, friends_with_new, friends_initial]):
         with patch('app.main.send_telegram_message') as mock_send, \
-             patch('app.main.create_splitwise_expense') as mock_create:
-            # Step 1: Send expense with misspelled friend
-            webhook_data = {
-                "message": {
-                    "chat": {"id": TEST_CHAT_ID},
-                    "text": "paid 500 for lunch with Bobb"  # Misspelled friend
+             patch('app.main.pending_new_friend', {}):
+            # Step 1: Send expense with misspelled friend (should trigger unknown friend logic)
+            with patch('app.main.parse_expense_from_text', return_value=parsed_expense):
+                webhook_data = {
+                    "message": {
+                        "chat": {"id": TEST_CHAT_ID},
+                        "text": "paid 500 for lunch with Bobb"  # Misspelled friend
+                    }
                 }
-            }
-            response = client.post("/telegram/webhook", json=webhook_data)
-            assert response.status_code == 200
-            mock_send.assert_called()
-            found = any("please reply with the correct friend's name" in call[0][1].lower() or "splitwise error" in call[0][1].lower() for call in mock_send.call_args_list)
-            assert found
+                response = client.post("/telegram/webhook", json=webhook_data)
+                assert response.status_code == 200
+                mock_send.assert_called()
+                found = any(
+                    ("please reply with the correct friend" in call[0][1].lower()) or
+                    ("could not find anyone named" in call[0][1].lower()) or
+                    ("splitwise error" in call[0][1].lower())
+                    for call in mock_send.call_args_list
+                )
+                if not found:
+                    print("Sent messages:", [call[0][1] for call in mock_send.call_args_list])
+                assert found
+            # Step 2: Simulate user replying with a new friend name (should allow expense creation)
+            with patch('app.main.create_splitwise_expense') as mock_create, \
+                 patch('app.main.parse_expense_from_text', return_value=parsed_expense):
+                webhook_data2 = {
+                    "message": {
+                        "chat": {"id": TEST_CHAT_ID},
+                        "text": "Charlie"
+                    }
+                }
+                response2 = client.post("/telegram/webhook", json=webhook_data2)
+                assert response2.status_code == 200
+                mock_create.assert_called()
 
 @pytest.mark.asyncio
 async def test_expense_api_endpoint(mock_token_storage):
