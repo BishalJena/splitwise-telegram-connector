@@ -1,16 +1,30 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.so
+
+# Virtualenv
+venv/
+
+# Test & coverage artifacts
+.coverage
+.pytest_cache/
+test_output.txt
+
+# Environment & secrets
 .env
 user_tokens.json
 pending_oauth.json
+
+# MacOS
 .DS_Store
+
+# API spec (uncomment if not publishing)
+openapi.json
+
 .idea/
 .vscode/
-.pytest_cache/
 .cursorrules
 .cursorignore
 .gitignore
-changelog.md
-.coverage
 openai.json
-
