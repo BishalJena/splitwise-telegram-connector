@@ -11,4 +11,6 @@ pending_oauth.json
 .cursorignore
 .gitignore
 changelog.md
+.coverage
+openai.json
 

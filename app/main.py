@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, APIRouter, HTTPException
+from fastapi import FastAPI, Request, APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
@@ -11,6 +11,9 @@ import traceback
 import re
 import asyncio
 from typing import Optional
+from supermemory import Supermemory
+import datetime
+from fastapi.responses import JSONResponse
 
 # Load environment variables
 load_dotenv()
@@ -56,6 +59,9 @@ router = APIRouter()
 pending_expenses = {}
 # In-memory context for pending new friend creation
 pending_new_friend = {}
+
+# After load_dotenv()
+supermemory_client = Supermemory(api_key=os.environ.get("SUPERMEMORY_API_KEY"))
 
 @app.get("/health")
 def health():
@@ -490,6 +496,23 @@ async def telegram_webhook(req: Request):
             await send_telegram_message(chat_id, f"❌ Failed to add expense: {res['errors']}")
         else:
             await send_telegram_message(chat_id, f"✅ Expense added: {normalized['description']} - {format_amount(normalized['cost'], normalized['currency_code'])}")
+            # Store expense in supermemory (non-sensitive data only)
+            try:
+                supermemory_client.memories.add(
+                    content=text,  # The original user message
+                    container_tags=[str(chat_id)],
+                    metadata={
+                        "type": "expense",
+                        "content_type": "expense",
+                        "description": normalized.get("description"),
+                        "amount": normalized.get("cost"),
+                        "currency": normalized.get("currency_code"),
+                        "participants": ", ".join([p["name"] for p in normalized.get("participants", [])]),
+                        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    }
+                )
+            except Exception as e:
+                logging.warning(f"supermemory expense store failed: {e}")
     except HTTPException as he:
         if he.status_code == 409 and str(he.detail).startswith("PENDING_NEW_FRIEND::"):
             friend_name = str(he.detail).split("::", 1)[1]
@@ -500,6 +523,35 @@ async def telegram_webhook(req: Request):
     except Exception as e:
         logging.exception("Expense handling error")
         await send_telegram_message(chat_id, "❌ Error processing expense. Please check your message format.")
+
+    # If not a command or expense, treat as a search query
+    try:
+        results = supermemory_client.search.execute(
+            q=text,
+            user_id=str(chat_id),
+            limit=5,
+            rerank=True,
+            rewrite_query=True
+        )
+        if not results.results:
+            await send_telegram_message(chat_id, "No relevant results found in your history.")
+        else:
+            msg_lines = []
+            for r in results.results:
+                snippet = r.chunks[0].content if r.chunks else ""
+                meta = r.metadata or {}
+                if meta.get("content_type") == "expense":
+                    desc = meta.get("description", "(No description)")
+                    amt = meta.get("amount", "?")
+                    curr = meta.get("currency", "")
+                    msg_lines.append(f"• {desc}: {amt} {curr}")
+                else:
+                    msg_lines.append(f"• {snippet[:100]}")
+            msg = "Here are the most relevant results I found:\n" + "\n".join(msg_lines)
+            await send_telegram_message(chat_id, msg)
+    except Exception as e:
+        logging.warning(f"supermemory search in webhook failed: {e}")
+        await send_telegram_message(chat_id, "Sorry, I couldn't search your history due to an error.")
     return {"ok": True}
 
 # ----------- Additional API Endpoints -----------
@@ -529,6 +581,39 @@ async def setup_telegram_webhook(data: WebhookInput):
     except Exception as e:
         logging.exception("Webhook setup failed")
         raise HTTPException(status_code=500, detail="Webhook setup failed")
+
+@app.post("/api/search_memories")
+async def search_memories(chat_id: str = Query(...), query: str = Query(...), type_filter: str = Query(None)):
+    """Search a user's chat and expense history using supermemory semantic search."""
+    filters = None
+    if type_filter:
+        filters = {
+            "AND": [
+                {"key": "content_type", "value": type_filter, "negate": False}
+            ]
+        }
+    try:
+        results = supermemory_client.search.execute(
+            q=query,
+            user_id=str(chat_id),
+            limit=10,
+            filters=filters,
+            rewrite_query=True,
+            rerank=True
+        )
+        formatted = [
+            {
+                "id": r.document_id,
+                "content": r.chunks[0].content if r.chunks else "",
+                "score": r.score,
+                "metadata": r.metadata
+            }
+            for r in results.results
+        ]
+        return JSONResponse(content={"results": formatted})
+    except Exception as e:
+        logging.warning(f"supermemory search failed: {e}")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 # Include router and root
 app.include_router(router)
