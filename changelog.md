@@ -1,3 +1,15 @@
+# [24:06:27 00:00:00] {Sync check: codebase, docs, and tests}
+- Verified that the codebase, documentation (README.md), and tests are fully in sync as of this date.
+- No new features, bugfixes, or changes have been made since the previous entry.
+- All instructions, commands, and video links in README.md are accurate and up-to-date.
+
+# [24:06:26 17:00:00] {Final polish: .gitignore, code, and production readiness}
+- Updated `.gitignore` to exclude secrets, local artifacts, and OS files, and to allow `changelog.md` to be tracked.
+- Finalized and pushed all changes in `app/main.py` and `app/test_main.py`:
+  - Expense split logic and supermemory integration are now robust and production-ready.
+  - All tests pass; coverage remains high.
+- Project is now fully production-ready and clean for open source release.
+
 # [24:06:26 16:00:00] {Major features, testing, and documentation overhaul}
 - **Authoritative split:** Expense confirmation and supermemory storage now use the authoritative split as returned by the Splitwise API, not just the parsed input. User names and shares are mapped from the API response.
 - **Supermemory integration:** All expenses and chat messages are stored in supermemory, partitioned per user. Metadata now includes the authoritative split (as JSON string) and content type.
