@@ -3,6 +3,10 @@
 A FastAPI-based backend to connect Telegram with Splitwise, allowing users to add expenses via a Telegram bot, with OpenAI-powered parsing and semantic memory/search via supermemory.
 
 ---
+https://github.com/user-attachments/assets/60e81d3b-027b-40fd-965d-2d31ab384e75
+
+[Youtube Demo: https://youtu.be/FY1rhC9Ax3g?si=y6nG-xkbs_epzSEJ]
+---
 
 ## Features
 - Multi-user Splitwise OAuth
@@ -133,6 +137,14 @@ splitwise-telegram-connector/
 - **Robust error handling:** Only confirms expenses if Splitwise API succeeds.
 - **Semantic memory:** All user data is partitioned and searchable.
 - **Production-ready:** Secure, tested, and easy to deploy.
+
+---
+
+## Roadmap / Planned Features
+
+- Refactor `main.py` for clarity and maintainability (currently 1000+ lines)
+- Improve performance and reduce latency for a snappier user experience
+- Add multimodal support: process voice notes and receipt images for expense entry
 
 ---
 
